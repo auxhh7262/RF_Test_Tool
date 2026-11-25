@@ -1,9 +1,13 @@
-# ====== Python ======
+# ====== Python / 虚拟环境 ======
 __pycache__/
 *.py[cod]
 *.pyo
 *.egg-info/
 *.egg
+.venv/
+.venv38/
+.venv*/
+env/
 
 # ====== PyInstaller ======
 build/
