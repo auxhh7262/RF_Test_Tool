@@ -1,0 +1,469 @@
+﻿LTE 频段 / 支持带宽 / 低·中·高信道 对照表
+==============================================================================
+数据来源 : specs/LTE\bands.json（本目录本地快照）
+           RF Band Tool，3GPP R19 / TS 36.101，共 73 个 LTE 频段
+算法来源 : TS 36.101 5.7.3 / 本脚本 hml()
+           lo = max(n_offs + B*5, n_min)
+           hi = min(n_max - B*5 + 1, n_max)
+           mid = (lo + hi) // 2     [B*5 = (B/2)/0.1MHz，信道须整条落在频段内]
+校验     : 已按频段频率边界逐点验证 239 个 频段×带宽 组合的低/中/高信道，全部通过
+
+命名约定 : 界面显示 频段 B1/B2/…/B111，带宽 1.4MHz/3MHz/5MHz/10MHz/15MHz/20MHz
+           CMW500 SCPI 内部仍用 CONF:LTE:SIGN:BAND OB<n> 与
+           CONF:LTE:SIGN:CELL:BAND:DL B0xx（仪表只接受此写法，见下表对照）
+
+本工具可用频段 : 63 个（其余 10 个见文末说明）
+频段×带宽组合 : 239 个，每组合测 低/中/高 三个 DL EARFCN（重合时去重）
+界面用法   : 工具中每个频段一行，只能勾选该频段支持的带宽（不支持显示 — ）；
+           测试项 = 各频段自己勾选的带宽，不做全局频段×带宽笛卡尔积。
+           勾选频段默认只勾 10MHz；不支持 10MHz 的频段默认取最接近的支持带宽。
+           批量：先勾多个频段，再点表头带宽复选框即可整列一次生效。
+注意       : 各频段只测其支持的带宽；不支持的组合自动跳过，不下发非法信道。
+           高位频段能否由 CMW500 建立小区，以仪表固件/LTE 信令选件为准。
+
+------------------------------------------------------------------------------
+频段 B1    [FDD]  DL EARFCN 0 ~ 599   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH25          CH300         CH575         B050
+    10MHz       CH50          CH300         CH550         B100
+    15MHz       CH75          CH300         CH525         B150
+    20MHz       CH100         CH300         CH500         B200
+
+频段 B2    [FDD]  DL EARFCN 600 ~ 1199   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH607         CH900         CH1193        B014
+    3MHz        CH615         CH900         CH1185        B030
+    5MHz        CH625         CH900         CH1175        B050
+    10MHz       CH650         CH900         CH1150        B100
+    15MHz       CH675         CH900         CH1125        B150
+    20MHz       CH700         CH900         CH1100        B200
+
+频段 B3    [FDD]  DL EARFCN 1200 ~ 1949   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH1207        CH1575        CH1943        B014
+    3MHz        CH1215        CH1575        CH1935        B030
+    5MHz        CH1225        CH1575        CH1925        B050
+    10MHz       CH1250        CH1575        CH1900        B100
+    15MHz       CH1275        CH1575        CH1875        B150
+    20MHz       CH1300        CH1575        CH1850        B200
+
+频段 B4    [FDD]  DL EARFCN 1950 ~ 2399   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH1957        CH2175        CH2393        B014
+    3MHz        CH1965        CH2175        CH2385        B030
+    5MHz        CH1975        CH2175        CH2375        B050
+    10MHz       CH2000        CH2175        CH2350        B100
+    15MHz       CH2025        CH2175        CH2325        B150
+    20MHz       CH2050        CH2175        CH2300        B200
+
+频段 B5    [FDD]  DL EARFCN 2400 ~ 2649   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH2407        CH2525        CH2643        B014
+    3MHz        CH2415        CH2525        CH2635        B030
+    5MHz        CH2425        CH2525        CH2625        B050
+    10MHz       CH2450        CH2525        CH2600        B100
+
+频段 B6    [FDD]  DL EARFCN 2650 ~ 2749   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH2675        CH2700        CH2725        B050
+    10MHz       CH2700        CH2700        CH2700        B100
+
+频段 B7    [FDD]  DL EARFCN 2750 ~ 3449   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH2775        CH3100        CH3425        B050
+    10MHz       CH2800        CH3100        CH3400        B100
+    15MHz       CH2825        CH3100        CH3375        B150
+    20MHz       CH2850        CH3100        CH3350        B200
+
+频段 B8    [FDD]  DL EARFCN 3450 ~ 3799   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH3457        CH3625        CH3793        B014
+    3MHz        CH3465        CH3625        CH3785        B030
+    5MHz        CH3475        CH3625        CH3775        B050
+    10MHz       CH3500        CH3625        CH3750        B100
+
+频段 B9    [FDD]  DL EARFCN 3800 ~ 4149   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH3825        CH3975        CH4125        B050
+    10MHz       CH3850        CH3975        CH4100        B100
+    15MHz       CH3875        CH3975        CH4075        B150
+    20MHz       CH3900        CH3975        CH4050        B200
+
+频段 B10   [FDD]  DL EARFCN 4150 ~ 4749   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH4175        CH4450        CH4725        B050
+    10MHz       CH4200        CH4450        CH4700        B100
+    15MHz       CH4225        CH4450        CH4675        B150
+    20MHz       CH4250        CH4450        CH4650        B200
+
+频段 B11   [FDD]  DL EARFCN 4750 ~ 4949   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH4775        CH4850        CH4925        B050
+    10MHz       CH4800        CH4850        CH4900        B100
+
+频段 B12   [FDD]  DL EARFCN 5010 ~ 5179   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH5017        CH5095        CH5173        B014
+    3MHz        CH5025        CH5095        CH5165        B030
+    5MHz        CH5035        CH5095        CH5155        B050
+    10MHz       CH5060        CH5095        CH5130        B100
+
+频段 B13   [FDD]  DL EARFCN 5180 ~ 5279   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH5205        CH5230        CH5255        B050
+    10MHz       CH5230        CH5230        CH5230        B100
+
+频段 B14   [FDD]  DL EARFCN 5280 ~ 5379   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH5305        CH5330        CH5355        B050
+    10MHz       CH5330        CH5330        CH5330        B100
+
+频段 B17   [FDD]  DL EARFCN 5730 ~ 5849   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH5755        CH5790        CH5825        B050
+    10MHz       CH5780        CH5790        CH5800        B100
+
+频段 B18   [FDD]  DL EARFCN 5850 ~ 5999   支持带宽: 5MHz / 10MHz / 15MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH5875        CH5925        CH5975        B050
+    10MHz       CH5900        CH5925        CH5950        B100
+    15MHz       CH5925        CH5925        CH5925        B150
+
+频段 B19   [FDD]  DL EARFCN 6000 ~ 6149   支持带宽: 5MHz / 10MHz / 15MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH6025        CH6075        CH6125        B050
+    10MHz       CH6050        CH6075        CH6100        B100
+    15MHz       CH6075        CH6075        CH6075        B150
+
+频段 B20   [FDD]  DL EARFCN 6150 ~ 6449   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH6175        CH6300        CH6425        B050
+    10MHz       CH6200        CH6300        CH6400        B100
+    15MHz       CH6225        CH6300        CH6375        B150
+    20MHz       CH6250        CH6300        CH6350        B200
+
+频段 B21   [FDD]  DL EARFCN 6450 ~ 6599   支持带宽: 5MHz / 10MHz / 15MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH6475        CH6525        CH6575        B050
+    10MHz       CH6500        CH6525        CH6550        B100
+    15MHz       CH6525        CH6525        CH6525        B150
+
+频段 B22   [FDD]  DL EARFCN 6600 ~ 7399   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH6625        CH7000        CH7375        B050
+    10MHz       CH6650        CH7000        CH7350        B100
+    15MHz       CH6675        CH7000        CH7325        B150
+    20MHz       CH6700        CH7000        CH7300        B200
+
+频段 B23   [FDD]  DL EARFCN 7500 ~ 7699   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH7507        CH7600        CH7693        B014
+    3MHz        CH7515        CH7600        CH7685        B030
+    5MHz        CH7525        CH7600        CH7675        B050
+    10MHz       CH7550        CH7600        CH7650        B100
+    15MHz       CH7575        CH7600        CH7625        B150
+    20MHz       CH7600        CH7600        CH7600        B200
+
+频段 B24   [FDD]  DL EARFCN 7700 ~ 8039   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH7725        CH7870        CH8015        B050
+    10MHz       CH7750        CH7870        CH7990        B100
+
+频段 B25   [FDD]  DL EARFCN 8040 ~ 8689   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH8047        CH8365        CH8683        B014
+    3MHz        CH8055        CH8365        CH8675        B030
+    5MHz        CH8065        CH8365        CH8665        B050
+    10MHz       CH8090        CH8365        CH8640        B100
+    15MHz       CH8115        CH8365        CH8615        B150
+    20MHz       CH8140        CH8365        CH8590        B200
+
+频段 B26   [FDD]  DL EARFCN 8690 ~ 9039   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH8697        CH8865        CH9033        B014
+    3MHz        CH8705        CH8865        CH9025        B030
+    5MHz        CH8715        CH8865        CH9015        B050
+    10MHz       CH8740        CH8865        CH8990        B100
+    15MHz       CH8765        CH8865        CH8965        B150
+
+频段 B27   [FDD]  DL EARFCN 9040 ~ 9209   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH9047        CH9125        CH9203        B014
+    3MHz        CH9055        CH9125        CH9195        B030
+    5MHz        CH9065        CH9125        CH9185        B050
+    10MHz       CH9090        CH9125        CH9160        B100
+
+频段 B28   [FDD]  DL EARFCN 9210 ~ 9659   支持带宽: 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    3MHz        CH9225        CH9435        CH9645        B030
+    5MHz        CH9235        CH9435        CH9635        B050
+    10MHz       CH9260        CH9435        CH9610        B100
+    15MHz       CH9285        CH9435        CH9585        B150
+    20MHz       CH9310        CH9435        CH9560        B200
+
+频段 B30   [FDD]  DL EARFCN 9770 ~ 9869   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH9795        CH9820        CH9845        B050
+    10MHz       CH9820        CH9820        CH9820        B100
+
+频段 B31   [FDD]  DL EARFCN 9870 ~ 9919   支持带宽: 1.4MHz / 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH9877        CH9895        CH9913        B014
+    3MHz        CH9885        CH9895        CH9905        B030
+    5MHz        CH9895        CH9895        CH9895        B050
+
+频段 B33   [TDD]  DL EARFCN 36000 ~ 36199   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH36025       CH36100       CH36175       B050
+    10MHz       CH36050       CH36100       CH36150       B100
+    15MHz       CH36075       CH36100       CH36125       B150
+    20MHz       CH36100       CH36100       CH36100       B200
+
+频段 B34   [TDD]  DL EARFCN 36200 ~ 36349   支持带宽: 5MHz / 10MHz / 15MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH36225       CH36275       CH36325       B050
+    10MHz       CH36250       CH36275       CH36300       B100
+    15MHz       CH36275       CH36275       CH36275       B150
+
+频段 B35   [TDD]  DL EARFCN 36350 ~ 36949   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH36357       CH36650       CH36943       B014
+    3MHz        CH36365       CH36650       CH36935       B030
+    5MHz        CH36375       CH36650       CH36925       B050
+    10MHz       CH36400       CH36650       CH36900       B100
+    15MHz       CH36425       CH36650       CH36875       B150
+    20MHz       CH36450       CH36650       CH36850       B200
+
+频段 B36   [TDD]  DL EARFCN 36950 ~ 37549   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH36957       CH37250       CH37543       B014
+    3MHz        CH36965       CH37250       CH37535       B030
+    5MHz        CH36975       CH37250       CH37525       B050
+    10MHz       CH37000       CH37250       CH37500       B100
+    15MHz       CH37025       CH37250       CH37475       B150
+    20MHz       CH37050       CH37250       CH37450       B200
+
+频段 B37   [TDD]  DL EARFCN 37550 ~ 37749   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH37575       CH37650       CH37725       B050
+    10MHz       CH37600       CH37650       CH37700       B100
+    15MHz       CH37625       CH37650       CH37675       B150
+    20MHz       CH37650       CH37650       CH37650       B200
+
+频段 B38   [TDD]  DL EARFCN 37750 ~ 38249   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH37775       CH38000       CH38225       B050
+    10MHz       CH37800       CH38000       CH38200       B100
+    15MHz       CH37825       CH38000       CH38175       B150
+    20MHz       CH37850       CH38000       CH38150       B200
+
+频段 B39   [TDD]  DL EARFCN 38250 ~ 38649   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH38275       CH38450       CH38625       B050
+    10MHz       CH38300       CH38450       CH38600       B100
+    15MHz       CH38325       CH38450       CH38575       B150
+    20MHz       CH38350       CH38450       CH38550       B200
+
+频段 B40   [TDD]  DL EARFCN 38650 ~ 39649   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH38675       CH39150       CH39625       B050
+    10MHz       CH38700       CH39150       CH39600       B100
+    15MHz       CH38725       CH39150       CH39575       B150
+    20MHz       CH38750       CH39150       CH39550       B200
+
+频段 B41   [TDD]  DL EARFCN 39650 ~ 41589   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH39675       CH40620       CH41565       B050
+    10MHz       CH39700       CH40620       CH41540       B100
+    15MHz       CH39725       CH40620       CH41515       B150
+    20MHz       CH39750       CH40620       CH41490       B200
+
+频段 B42   [TDD]  DL EARFCN 41590 ~ 43589   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH41615       CH42590       CH43565       B050
+    10MHz       CH41640       CH42590       CH43540       B100
+    15MHz       CH41665       CH42590       CH43515       B150
+    20MHz       CH41690       CH42590       CH43490       B200
+
+频段 B43   [TDD]  DL EARFCN 43590 ~ 45589   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH43615       CH44590       CH45565       B050
+    10MHz       CH43640       CH44590       CH45540       B100
+    15MHz       CH43665       CH44590       CH45515       B150
+    20MHz       CH43690       CH44590       CH45490       B200
+
+频段 B44   [TDD]  DL EARFCN 45590 ~ 46589   支持带宽: 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    3MHz        CH45605       CH46090       CH46575       B030
+    5MHz        CH45615       CH46090       CH46565       B050
+    10MHz       CH45640       CH46090       CH46540       B100
+    15MHz       CH45665       CH46090       CH46515       B150
+    20MHz       CH45690       CH46090       CH46490       B200
+
+频段 B45   [TDD]  DL EARFCN 46590 ~ 46789   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH46615       CH46690       CH46765       B050
+    10MHz       CH46640       CH46690       CH46740       B100
+    15MHz       CH46665       CH46690       CH46715       B150
+    20MHz       CH46690       CH46690       CH46690       B200
+
+频段 B46   [TDD]  DL EARFCN 46790 ~ 54539   支持带宽: 10MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    10MHz       CH46840       CH50665       CH54490       B100
+    20MHz       CH46890       CH50665       CH54440       B200
+
+频段 B47   [TDD]  DL EARFCN 54540 ~ 55239   支持带宽: 10MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    10MHz       CH54590       CH54890       CH55190       B100
+    20MHz       CH54640       CH54890       CH55140       B200
+
+频段 B48   [TDD]  DL EARFCN 55240 ~ 56739   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH55265       CH55990       CH56715       B050
+    10MHz       CH55290       CH55990       CH56690       B100
+    15MHz       CH55315       CH55990       CH56665       B150
+    20MHz       CH55340       CH55990       CH56640       B200
+
+频段 B49   [TDD]  DL EARFCN 56740 ~ 58239   支持带宽: 10MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    10MHz       CH56790       CH57490       CH58190       B100
+    20MHz       CH56840       CH57490       CH58140       B200
+
+频段 B50   [TDD]  DL EARFCN 58240 ~ 59089   支持带宽: 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    3MHz        CH58255       CH58665       CH59075       B030
+    5MHz        CH58265       CH58665       CH59065       B050
+    10MHz       CH58290       CH58665       CH59040       B100
+    15MHz       CH58315       CH58665       CH59015       B150
+    20MHz       CH58340       CH58665       CH58990       B200
+
+频段 B51   [TDD]  DL EARFCN 59090 ~ 59139   支持带宽: 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    3MHz        CH59105       CH59115       CH59125       B030
+    5MHz        CH59115       CH59115       CH59115       B050
+
+频段 B52   [TDD]  DL EARFCN 59140 ~ 60139   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH59165       CH59640       CH60115       B050
+    10MHz       CH59190       CH59640       CH60090       B100
+    15MHz       CH59215       CH59640       CH60065       B150
+    20MHz       CH59240       CH59640       CH60040       B200
+
+频段 B53   [TDD]  DL EARFCN 60140 ~ 60254   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH60147       CH60197       CH60248       B014
+    3MHz        CH60155       CH60197       CH60240       B030
+    5MHz        CH60165       CH60197       CH60230       B050
+    10MHz       CH60190       CH60197       CH60205       B100
+
+频段 B54   [TDD]  DL EARFCN 60255 ~ 60304   支持带宽: 1.4MHz / 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH60262       CH60280       CH60298       B014
+    3MHz        CH60270       CH60280       CH60290       B030
+    5MHz        CH60280       CH60280       CH60280       B050
+
+频段 B65   [FDD]  DL EARFCN 65536 ~ 66435   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH65543       CH65986       CH66429       B014
+    3MHz        CH65551       CH65986       CH66421       B030
+    5MHz        CH65561       CH65986       CH66411       B050
+    10MHz       CH65586       CH65986       CH66386       B100
+    15MHz       CH65611       CH65986       CH66361       B150
+    20MHz       CH65636       CH65986       CH66336       B200
+
+频段 B66   [FDD]  DL EARFCN 66436 ~ 67335   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH66443       CH66886       CH67329       B014
+    3MHz        CH66451       CH66886       CH67321       B030
+    5MHz        CH66461       CH66886       CH67311       B050
+    10MHz       CH66486       CH66886       CH67286       B100
+    15MHz       CH66511       CH66886       CH67261       B150
+    20MHz       CH66536       CH66886       CH67236       B200
+
+频段 B68   [FDD]  DL EARFCN 67536 ~ 67835   支持带宽: 5MHz / 10MHz / 15MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH67561       CH67686       CH67811       B050
+    10MHz       CH67586       CH67686       CH67786       B100
+    15MHz       CH67611       CH67686       CH67761       B150
+
+频段 B70   [FDD]  DL EARFCN 68336 ~ 68585   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH68361       CH68461       CH68561       B050
+    10MHz       CH68386       CH68461       CH68536       B100
+    15MHz       CH68411       CH68461       CH68511       B150
+    20MHz       CH68436       CH68461       CH68486       B200
+
+频段 B71   [FDD]  DL EARFCN 68586 ~ 68935   支持带宽: 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH68611       CH68761       CH68911       B050
+    10MHz       CH68636       CH68761       CH68886       B100
+    15MHz       CH68661       CH68761       CH68861       B150
+    20MHz       CH68686       CH68761       CH68836       B200
+
+频段 B72   [FDD]  DL EARFCN 68936 ~ 68985   支持带宽: 1.4MHz / 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH68943       CH68961       CH68979       B014
+    3MHz        CH68951       CH68961       CH68971       B030
+    5MHz        CH68961       CH68961       CH68961       B050
+
+频段 B73   [FDD]  DL EARFCN 68986 ~ 69035   支持带宽: 1.4MHz / 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH68993       CH69011       CH69029       B014
+    3MHz        CH69001       CH69011       CH69021       B030
+    5MHz        CH69011       CH69011       CH69011       B050
+
+频段 B74   [FDD]  DL EARFCN 69036 ~ 69465   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz / 15MHz / 20MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH69043       CH69251       CH69459       B014
+    3MHz        CH69051       CH69251       CH69451       B030
+    5MHz        CH69061       CH69251       CH69441       B050
+    10MHz       CH69086       CH69251       CH69416       B100
+    15MHz       CH69111       CH69251       CH69391       B150
+    20MHz       CH69136       CH69251       CH69366       B200
+
+频段 B85   [FDD]  DL EARFCN 70366 ~ 70545   支持带宽: 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    5MHz        CH70391       CH70456       CH70521       B050
+    10MHz       CH70416       CH70456       CH70496       B100
+
+频段 B87   [FDD]  DL EARFCN 70546 ~ 70595   支持带宽: 1.4MHz / 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH70553       CH70571       CH70589       B014
+    3MHz        CH70561       CH70571       CH70581       B030
+    5MHz        CH70571       CH70571       CH70571       B050
+
+频段 B88   [FDD]  DL EARFCN 70596 ~ 70645   支持带宽: 1.4MHz / 3MHz / 5MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH70603       CH70621       CH70639       B014
+    3MHz        CH70611       CH70621       CH70631       B030
+    5MHz        CH70621       CH70621       CH70621       B050
+
+频段 B106  [FDD]  DL EARFCN 70656 ~ 70705   支持带宽: 1.4MHz / 3MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH70663       CH70681       CH70699       B014
+    3MHz        CH70671       CH70681       CH70691       B030
+
+频段 B111  [FDD]  DL EARFCN 73386 ~ 73485   支持带宽: 1.4MHz / 3MHz / 5MHz / 10MHz
+    界面带宽    低信道        中信道        高信道        SCPI 带宽代码
+    1.4MHz      CH73393       CH73436       CH73479       B014
+    3MHz        CH73401       CH73436       CH73471       B030
+    5MHz        CH73411       CH73436       CH73461       B050
+    10MHz       CH73436       CH73436       CH73436       B100
+
+------------------------------------------------------------------------------
+未列入（不可测量）的频段:
+    B15   无 DL EARFCN/无 bandwidths_mhz 定义
+    B16   无 DL EARFCN/无 bandwidths_mhz 定义
+    B29   无 bandwidths_mhz 定义
+    B32   无 bandwidths_mhz 定义
+    B64   无 DL EARFCN/无 bandwidths_mhz 定义
+    B67   无 bandwidths_mhz 定义
+    B69   无 bandwidths_mhz 定义
+    B75   无 bandwidths_mhz 定义
+    B76   无 bandwidths_mhz 定义
+    B103  无 bandwidths_mhz 定义
+
+刷新方式: 在本目录运行  python refresh_lte_channels.py
+          工具运行时优先读取本目录 specs/LTE\bands.json 现场计算，
+          该文件缺失时回退 lte_channels.json 快照，再回退内置兜底表；
+          全程只访问本工具目录，不依赖任何外部路径。
