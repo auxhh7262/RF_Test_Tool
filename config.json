@@ -1,11 +1,63 @@
 {
+  "instrument": "CMW500",
+  "psu_model": "E36312A",
   "cmw_ip": "10.38.26.112",
   "cmw_port": "5025",
-  "rf": "RF1C",
-  "rx": "RX1",
+  "cmw_link": "LAN",
+  "cmw_gpib_board": 0,
+  "rx_path": "prx",
+  "rf_port_combo": "RF3+RF4",
+  "_comment_rf_port_combo": "RF口组合，换口只改这一行: RF1+RF2 = RF1COM主集/RF2COM分集(TX1,TX3,RX1); RF3+RF4 = RF3COM主集/RF4COM分集(TX2,TX4,RX2)。选中后 PRX/DRX/PRX+DRX 三种模式的路由与FDC校准口自动展开，rx_path_ports 由它覆盖；留空则用 rx_path_ports 手写端口（自定义接法）。",
+  "rx_path_ports": {
+    "prx": {
+      "scenario": "SCEL",
+      "rx": [
+        "RF3C",
+        "RX2"
+      ],
+      "tx": [
+        [
+          "RF3C",
+          "TX2"
+        ]
+      ]
+    },
+    "drx": {
+      "scenario": "SCEL",
+      "rx": [
+        "RF3C",
+        "RX2"
+      ],
+      "tx": [
+        [
+          "RF4C",
+          "TX2"
+        ]
+      ]
+    },
+    "prx_drx": {
+      "scenario": "MIMO22",
+      "rx": [
+        "RF3C",
+        "RX2"
+      ],
+      "tx": [
+        [
+          "RF3C",
+          "TX2"
+        ],
+        [
+          "RF4C",
+          "TX4"
+        ]
+      ]
+    }
+  },
   "psu_enable": true,
   "psu_ip": "10.38.186.137",
   "psu_port": "5025",
+  "psu_link": "LAN",
+  "psu_gpib_board": 0,
   "psu_channel": "P6V",
   "psu_voltage": "5",
   "psu_readv": true,
@@ -92,7 +144,8 @@
   "pmax": "23",
   "dl_rb": "N50",
   "dl_mod": "QPSK",
-  "freq_loss_segments": "450:0.3, 800:0.3, 1000:0.5, 1500:0.5, 2000:0.7, 2500:0.7, 3600:1.0",
+  "_comment_freq_loss_segments": "FDC线缆损耗表(频点MHz:损耗dB), 粗粒度经验值, 只保留1位小数: <=1GHz 0.3dB, 1.x~2.2GHz 0.5dB(含B1), 2.3GHz以上 0.7dB, 3.5GHz 1.0dB, 5GHz段 1.5dB; 锚点之间由CMW线性插值。实测 2GHz 损耗为 X dB 时: 运行 CMW500_LTE_Tool.exe --loss-table X 重新生成整表(按 X/0.5 等比缩放, 仍保留1位小数), 结果写入 exe 同目录 freq_loss_segments.txt, 复制替换本行",
+  "freq_loss_segments": "410:0.3, 1000:0.3, 1500:0.5, 2200:0.5, 2300:0.7, 2700:0.7, 3500:1.0, 3800:1.0, 5150:1.5, 5925:1.5",
   "freq_loss_enable": true,
   "sens_start": "-85",
   "sens_stop": "-135",
@@ -111,7 +164,7 @@
   "fast_retune_timeout": "8",
   "bler_subframes": "600",
   "bler_timeout": "10",
-  "tpc_settle": "4",
+  "tpc_settle": "2.5",
   "stats": "20",
   "chan_settle": "1.5",
   "mev_retry": "2",
@@ -127,6 +180,8 @@
   "power_scenario": "low",
   "sens_power_mode": "low",
   "sens_low_power": "-20",
+  "sens_skip_warmup_low": "1",
+  "_comment_sens_skip_warmup_low": "Pmin 档热点续扫时跳过 EBLer warmup：1=跳过（每信道省约 0.7s），0=每次都预同步；切功率档后首次测量始终 warmup，不受此开关影响",
   "metrics": {
     "maxpower": false,
     "aclr": false,
@@ -179,5 +234,18 @@
   "tdd_uldl": "1",
   "tdd_ssub": "7",
   "tdd_detect": "0",
-  "full_scan": false
+  "full_scan": false,
+  "cmw_gpib_addr": "20",
+  "psu_gpib_addr": "5",
+  "_comment_gpib_addr": "GPIB 主地址（只填数字）：切到 GPIB 接口时自动回填地址框，不用每次重新输入；LAN 地址存在 cmw_ip / psu_ip 里，两者互不覆盖。",
+  "psu_read_mode": "tx_only",
+  "sens_poll": "0.15",
+  "auto_resume": true,
+  "auto_resume_delay": "10",
+  "auto_resume_max_hours": "72",
+  "partial_save": true,
+  "partial_every": "50",
+  "partial_interval": "600",
+  "_comment_partial": "过程中同步保存：每测完一个组合就把已完成结果刷到 result\\LTE_<stamp>_partial.txt（<10ms，永远最新）；xlsx 每 partial_every 个组合或每 partial_interval 秒重建一次（整表重建，限频避免拖慢测量）。这两个文件不含「灵敏度探底」明细页，跑完导出正式报告后自动删除。partial_save=false 可整体关闭。",
+  "_comment_auto_resume": "断点续测：每测完一个组合自动写 state\\checkpoint.json（明细 .items.jsonl 逐条追加），关窗口/掉电/崩溃都不丢进度。工具启动时若发现未完成断点，且频段/带宽/指标/场景/RF口/门限与本文件一致，则在 auto_resume_delay 秒倒计时后自动初始化仪表并接着测（已完成的行回填到结果表，最终合并成一份报告）。auto_resume=false 只保留手动入口（点【开始测量】时询问）；auto_resume_max_hours 限制断点最长自动续测时长，0=不限制。"
 }

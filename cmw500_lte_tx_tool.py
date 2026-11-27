@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""CMW500 LTE 射频指标测试工具（信令模式，网线 / Raw Socket SCPI 控制）
+r"""CMW500 LTE 射频指标测试工具（信令模式，LAN Raw Socket 或 VISA/GPIB 控制）
 
-界面: 从上到下依次为 CMW500 配置行（右侧含 AT 控制：串口自动识别/手动 debug
-      指令）、电源配置行（行尾为 初始化仪表/开始测量/打开配置/打开频段表 按钮）、
-      频段/带宽勾选、指标勾选，
-      一个“初始化仪表”按钮 + 一个“开始测量”按钮，测完自动生成 Excel + TXT。
+界面: 从上到下依次为终测仪设置行（仪表/接口/板号/地址/接收模式 + 初始化按钮）、
+      电源设置行（电源/接口/板号/地址/通道/电压/程控）、AT 控制行（行尾靠右为
+      参数配置/频段参数/开始测量 三个按钮）、频段/带宽勾选、指标勾选；
+      测完自动生成 Excel + TXT。
+
+连接方式: 每台设备先选【接口】LAN / GPIB：
+      · LAN → 地址填 IPv4，走 Raw Socket，端口固定 5025（端口在 config.json 的
+        cmw_port/psu_port 里改，界面不再显示端口框）
+      · GPIB → 地址只填主地址数字（如 20），板号在【板号】下拉选 GPIB0/GPIB1
+      GPIB 由 ctypes 直调厂商 VISA 运行库（NI-VISA / Keysight IO Libraries），
+      不依赖 pyvisa；目标机未装 VISA 时仍可用 LAN，只是 GPIB 不可用。
+      接口/板号/地址都写在 config.json 里，直接改文件界面会即时同步。
 
 频段/带宽: 界面显示 B<n> / <数值>MHz；频段清单、各频段支持带宽、低中高信道
       全部取自本目录 specs\LTE\bands.json（RF Band Tool / 3GPP R19 的本地快照）。
@@ -26,10 +34,13 @@ r"""CMW500 LTE 射频指标测试工具（信令模式，网线 / Raw Socket SCP
   python cmw500_lte_tx_tool.py            # 打开 GUI
   python cmw500_lte_tx_tool.py --selftest # 无仪表自检（解析/命令构造/导出）
   python cmw500_lte_tx_tool.py --demo     # 无仪表演示测量 + 生成示例报告
+  python cmw500_lte_tx_tool.py --loss-table [2GHz损耗]  # 按 bands.json 重算推荐 FDC 损耗表
 """
 
 import argparse
+import ctypes
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -40,6 +51,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -87,19 +99,39 @@ _ensure_specs_dir()
 class RunLogger:
     """每次运行生成独立日志文件，写入脚本目录 logs/ 下；线程安全、行缓冲即时落盘。"""
 
-    def __init__(self, base_dir=None, prefix="cmw500"):
-        self.dir = os.path.join(base_dir or APP_DIR, "logs")
-        os.makedirs(self.dir, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.dir, "%s_%s.log" % (prefix, stamp))
-        n = 1
-        while os.path.exists(path):
-            path = os.path.join(self.dir, "%s_%s_%02d.log" % (prefix, stamp, n))
-            n += 1
-        self.path = path
+    def __init__(self, base_dir=None, prefix="cmw500", path=None):
+        if path:
+            self.dir = os.path.dirname(path)
+            os.makedirs(self.dir, exist_ok=True)
+            self.path = path
+        else:
+            self.dir = os.path.join(base_dir or APP_DIR, "logs")
+            os.makedirs(self.dir, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self.dir, "%s_%s.log" % (prefix, stamp))
+            n = 1
+            while os.path.exists(path):
+                path = os.path.join(self.dir, "%s_%s_%02d.log" % (prefix, stamp, n))
+                n += 1
+            self.path = path
         self._lock = threading.Lock()
-        self._f = open(path, "w", encoding="utf-8", buffering=1)
+        self._f = open(self.path, "w", encoding="utf-8", buffering=1)
         self._f.write("启动时间: %s\n" % datetime.datetime.now().isoformat(timespec="seconds"))
+
+    def restart(self, path):
+        """关闭当前日志并新建指定文件（每次点击开始测试时调用）。"""
+        with self._lock:
+            try:
+                self._f.write("日志切换（新一轮测试开始）\n")
+                self._f.close()
+            except Exception:
+                pass
+            self.dir = os.path.dirname(path)
+            os.makedirs(self.dir, exist_ok=True)
+            self.path = path
+            self._f = open(path, "w", encoding="utf-8", buffering=1)
+            self._f.write("启动时间: %s\n" %
+                          datetime.datetime.now().isoformat(timespec="seconds"))
 
     def _stamp(self):
         return datetime.datetime.now().strftime("%H:%M:%S")
@@ -140,6 +172,15 @@ class ScpiError(Exception):
     pass
 
 
+class LinkError(ValueError):
+    """地址/接口填写错误（给用户看的业务错误，不甩堆栈）。
+
+    继承 ValueError 以兼容原有捕获，但初始化线程会单独识别它并只回消息文本——
+    真机 18:44 那次「GPIO0::20::INSTR」把一个「地址写错」的错误整段 traceback
+    弹给用户看，排障价值为零。
+    """
+
+
 class ScpiTransport:
     def __init__(self, host, port=5025, timeout=10.0, eol="\n"):
         self.host = host
@@ -154,7 +195,17 @@ class ScpiTransport:
 
     def connect(self):
         self.close()
-        s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        # 连接阶段的异常统一翻译成中文 ScpiError：原来 socket.gaierror 直接冒到
+        # 界面上只有一句 "getaddrinfo failed"，看不出是地址写错还是网线不通。
+        try:
+            s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        except socket.gaierror:
+            raise ScpiError(_bad_address_hint(self.host))
+        except socket.timeout:
+            raise ScpiError("连接 %s:%d 超时（%.0f s）：仪器未开机 / 网线不通 / 不是同一网段？"
+                            % (self.host, self.port, float(self.timeout or 0)))
+        except OSError as exc:
+            raise ScpiError("连接 %s:%d 失败：%s" % (self.host, self.port, exc))
         s.settimeout(self.timeout)
         self.sock = s
         try:
@@ -219,7 +270,7 @@ class ScpiTransport:
             except Exception:
                 pass
 
-    def query(self, cmd, timeout=None, expect=None):
+    def query(self, cmd, timeout=None, expect=None, retry=1):
         """发送查询并读一行响应。
 
         expect: 响应正则（re.search）。真实事故（cmw500_20261124_180539）：
@@ -228,33 +279,595 @@ class ScpiTransport:
         超时 → _discard_inflight 永不触发，错位自我维持到运行结束，10MHz
         三个组合的灵敏度全部废掉。因此超时防护不够，必须有内容级校验：
         响应与命令语义不符 → 排空残留流 → 重发一次。
+
+        retry: 超时后重试次数（默认 1）。真实事故（LTE_20261126_195411）：
+        连续跑 13.4 小时后，一次 STAT? 用 2s 短超时查询，仪表瞬时未应答就
+        抛 socket.timeout，直接终止整轮 7096 组合、13 小时数据全部作废。
+        查询是幂等的（FETC 只是重读最近一次结果），排空流后放大超时重发一次
+        即可救回绝大多数瞬时拥塞。
         """
         old = self.sock.gettimeout()
-        if timeout is not None:
-            self.sock.settimeout(timeout)
+        tmo = timeout if timeout is not None else old
+        tries = max(0, int(retry))
         try:
-            self.write(cmd)
-            resp = self._readline()
-            if expect is not None and resp is not None \
-                    and not re.search(expect, resp):
-                # 响应格式与命令不符 → 流错位，排空后重发一次
+            for attempt in range(tries + 1):
+                if timeout is not None or attempt:
+                    # 重试时放大超时：瞬时拥塞往往就是几秒，原超时太紧
+                    self.sock.settimeout(tmo if attempt == 0 else
+                                         max(float(tmo or 10) * 2.0,
+                                             float(tmo or 10) + 3.0))
                 try:
+                    self.write(cmd)
+                    resp = self._readline()
+                    if expect is not None and resp is not None \
+                            and not re.search(expect, resp):
+                        # 响应格式与命令不符 → 流错位，排空后重发一次
+                        try:
+                            self._discard_inflight()
+                        except Exception:
+                            pass
+                        self.write(cmd)
+                        resp = self._readline()
+                    return resp
+                except socket.timeout:
+                    # 本端超时但命令已发出：迟到响应会残留，必须清掉，否则后续
+                    # 查询全部错位一位（FETCH 拿到状态串、STAT 拿到数值串）。
                     self._discard_inflight()
-                except Exception:
-                    pass
-                self.write(cmd)
-                resp = self._readline()
-            return resp
-        except socket.timeout:
-            # 本端超时但命令已发出：迟到响应会残留，必须清掉，否则后续查询
-            # 全部错位一位（FETCH 拿到状态串、STAT 拿到数值串）。
-            self._discard_inflight()
-            raise
+                    if attempt >= tries:
+                        raise
+            raise socket.timeout("query 未执行")   # 理论不可达
         finally:
-            self.sock.settimeout(old)
+            try:
+                self.sock.settimeout(old)
+            except Exception:
+                pass
 
     def idn(self):
         return self.query("*IDN?")
+
+
+# ----------------------------------------------------------------------------
+# SCPI 传输（VISA：GPIB / USB / TCPIP::INSTR）
+# ----------------------------------------------------------------------------
+# 用 ctypes 直调厂商 VISA 运行库（NI-VISA 或 Keysight IO Libraries 的 visa32.dll），
+# 不引入 pyvisa 依赖、不增加打包体积；GPIB 只能经由 VISA 访问，无纯 Python 通路。
+# 目标机需已安装 VISA 运行库；缺失时给出明确提示而不是抛 OSError。
+
+VI_NULL = 0
+VI_TRUE = 1
+VI_FALSE = 0
+VI_ATTR_TERMCHAR = 0x3FFF0018       # 读终止符
+VI_ATTR_TERMCHAR_EN = 0x3FFF0038    # 终止符使能
+VI_ATTR_TMO_VALUE = 0x3FFF001A      # 超时（毫秒）
+VI_ERROR_TMO = -1073807339          # 0xBFFF0015 有符号形式
+
+_VISA_CACHE = {"dll": None, "rm": None, "err": None}
+
+# 资源串形如 GPIB0::20::INSTR / USB0::2733::87::...::INSTR / TCPIP0::1.2.3.4::inst0::INSTR
+# 同时认 GPIB0,20 / GPIB0:20 这类主/次地址简写（分隔符为逗号或单冒号）
+_VISA_RES_RE = re.compile(r"^(GPIB|USB|TCPIP|ASRL|VXI|PXI|RSNRP)[\s\-_]*\d*\s*(::|[,:])", re.I)
+# 只写了接口名+板号、没写分隔符的写法（GPIB0 / GPIB-0 / GPIB 0 20）
+_VISA_LOOSE_RE = re.compile(r"^(GPIB|USB|TCPIP|ASRL|VXI|PXI|RSNRP)[\s\-_]*\d+\b", re.I)
+
+# 中文输入法/网页粘贴最容易带进来的「看着一样其实是另一个字符」：
+# 全角冒号（GPIB0：：20）、全角逗号、全角数字/句点（１０．３８．２６．１１２）、
+# 零宽空格、BOM、不间断空格。真机 18:27 两次 "getaddrinfo failed" 就是这类地址
+# 落到 LAN 通路（DNS 解析）后的表现。
+_ADDR_TRANS = str.maketrans(dict(
+    {
+        "\uff1a": ":", "\uff0c": ",", "\uff0f": "/", "\uff0d": "-", "\u3000": " ",
+        "\uff0e": ".", "\u3002": ".",
+        "\u200b": "", "\u200c": "", "\u200d": "", "\ufeff": "", "\u00a0": " ",
+    },
+    **{chr(0xFF10 + i): str(i) for i in range(10)},   # 全角数字 ０-９
+))
+
+
+def clean_address(addr):
+    """规整地址输入：全角标点→半角、去零宽/控制字符、纠 GPIB 常见手误、去空白。"""
+    a = str(addr or "").translate(_ADDR_TRANS)
+    a = "".join(ch for ch in a if ch >= " ")
+    return fix_gpib_typo(a.strip())
+
+
+# GPIB 常见手误：把 GPIB 打成 GPIO / GBIP / GIPB / GPIP / GPBI，
+# 或把板号数字 0 打成字母 O（GPIBO0 / GPIBO）。
+# 真机 18:44 报错就是 "GPIO0::20::INSTR"：正常应当直接救回来，
+# 而不是让用户对着 ValueError 猜是哪里写错。
+# 只在后面紧跟数字/空格/::/逗号冒号时纠正，避免把 gpio-server、
+# gpib-lab-pc 这类主机名改坏。
+_GPIB_TYPO_HEAD_RE = re.compile(
+    r"^(visa://[^/]+/)?(GPIO|GBIP|GIPB|GPIP|GPBI)(?=[\s0-9]|::|[,:]|$)", re.I)
+_GPIB_TYPO_O_RE = re.compile(
+    r"^(visa://[^/]+/)?GPIB[Oo](?=[\s0-9]|::|[,:]|$)", re.I)
+
+
+def fix_gpib_typo(addr):
+    """纠正 GPIB 前缀/板号的常见手误：GPIO0::20::INSTR → GPIB0::20::INSTR。"""
+    a = str(addr or "")
+    if not a:
+        return a
+    a = _GPIB_TYPO_HEAD_RE.sub(lambda m: (m.group(1) or "") + "GPIB", a)
+    a = _GPIB_TYPO_O_RE.sub(lambda m: (m.group(1) or "") + "GPIB", a)
+    return a
+
+
+def is_visa_address(addr):
+    """地址是否应按 VISA 资源串处理（GPIB/USB/TCPIP::…::INSTR、visa://…）。"""
+    a = clean_address(addr)
+    if not a:
+        return False
+    if a.lower().startswith("visa://"):
+        return True
+    return bool(_VISA_RES_RE.match(a) or _VISA_LOOSE_RE.match(a))
+
+
+def normalize_visa_address(addr):
+    """把用户习惯写法归一成 VISA 资源串。
+
+    支持：
+      GPIB0::20::INSTR（标准）/ GPIB0::20 / GPIB::20::INSTR
+      GPIB0,20 / GPIB0:20 / GPIB 0 20 / GPIB-0::20（常见简写与手误）
+      visa://host/GPIB0::20::INSTR（VISA 服务器）
+    其它写法原样返回（已做全角/零宽清理）。
+    """
+    a = clean_address(addr)
+    if not a:
+        return a
+    perfix = ""
+    m0 = re.match(r"^(visa://[^/]+/)(.+)$", a, re.I)
+    if m0:
+        perfix, a = m0.group(1), m0.group(2)
+    m = re.match(r"^(GPIB)[\s\-_]*(\d*)\s*(?:::|[,:]|\s)\s*(\d+)\s*(::\w+)?$",
+                 a, re.I)
+    if not m:
+        return perfix + a
+    _kw, board, prim, suffix = m.groups()
+    board = board or "0"
+    suffix = (suffix or "::INSTR").upper()
+    if not suffix.startswith("::"):
+        suffix = "::" + suffix
+    return "%sGPIB%s::%s%s" % (perfix, board, prim, suffix)
+
+
+def split_host_port(address, port=5025):
+    """LAN 地址拆主机与端口：'10.1.2.3:5025' / '10.38.26. 112' 这类混填也能救回来。
+
+    VISA 资源串原样返回（端口框对它无效）；端口非法时回落 5025。
+    """
+    a = clean_address(address)
+    if not a or is_visa_address(a):
+        return a, port
+    a = re.sub(r"\s+", "", a)          # 主机名/IP 里不允许空格，粘进去的直接去掉
+    m = re.match(r"^([^:]+):(\d{1,5})$", a)
+    if m:
+        return m.group(1), m.group(2)
+    return a, port
+
+
+def _bad_address_hint(host):
+    """地址解析失败时给用户看的排查提示（不是堆栈，是能照着改的步骤）。"""
+    return ("地址 \"%s\" 无法解析为 IP / 主机名。\n"
+            "• 走网线：地址框只填 IPv4（如 10.38.26.112），端口填右侧『端口』框\n"
+            "• 走 GPIB：填 GPIB0::20::INSTR（简写 GPIB0,20 也认）\n"
+            "• 用主机名：需本机能被 DNS/局域网解析，可先在 cmd 里 ping 一下\n"
+            "• 注意别混入中文全角冒号/空格（GPIB0：：20 会自动纠正，其它字符不会）"
+            % host)
+
+
+LINK_MODES = ("LAN", "GPIB")
+_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-.]*[A-Za-z0-9])?$")
+
+
+def link_mode_from_address(addr):
+    """由地址推断接口类型（旧配置没有 cmw_link/psu_link 时用）。"""
+    a = clean_address(addr)
+    if is_visa_address(a):
+        return "GPIB"
+    if re.fullmatch(r"\d{1,3}", a):
+        return "GPIB"      # 只写了 GPIB 主地址（20），旧配置可能这样存
+    return "LAN"
+
+
+def look_like_host(addr):
+    """像 IPv4 / 主机名（用于判断地址与接口下拉是否打架）。"""
+    a = clean_address(addr)
+    if not a:
+        return False
+    return bool(_IPV4_RE.match(a) or _HOSTNAME_RE.match(a))
+
+
+def normalize_gpib_short(addr, board="0"):
+    """GPIB 模式下允许只写主地址：20 → GPIB0::20::INSTR（其它写法走通用归一）。"""
+    a = clean_address(addr)
+    if re.fullmatch(r"\d{1,3}", a):
+        return "GPIB%s::%s::INSTR" % (board, a)
+    return normalize_visa_address(a)
+
+
+# ----------------------------------------------------------------------------
+# GPIB 地址：界面只让用户填「主地址数字」（20），板号单独下拉（GPIB0 / GPIB1）
+# 一个数字能把输错概率降到最低——不必记 GPIB0::20::INSTR 这种资源串格式。
+# ----------------------------------------------------------------------------
+GPIB_BOARDS = ("0", "1")          # 常见单卡 / 双卡配置；更多卡在 config 里写数字即可
+GPIB_PRIMARY_MAX = 30             # IEEE 488 主地址范围 0~30
+
+
+def gpib_board_of(value, default=0):
+    """把板号取值（0 / "1" / "GPIB1" / 空）统一成 int。"""
+    s = str(value if value is not None else "").strip().upper()
+    if s.startswith("GPIB"):
+        s = s[4:]
+    m = re.search(r"\d+", s)
+    try:
+        n = int(m.group()) if m else int(default)
+    except (TypeError, ValueError):
+        n = 0
+    return max(0, n)
+
+
+def gpib_board_label(board):
+    """板号显示文本：0 → GPIB0。"""
+    return "GPIB%d" % gpib_board_of(board)
+
+
+def parse_gpib_addr(addr):
+    """解析用户填的 GPIB 地址，返回 (板号或 None, 主地址字符串)；不认识则 None。
+
+    认这些写法：  20 / " 20 " / GPIB0::20::INSTR / GPIB1,20 / GPIB0:20 / gpib-0 20
+    返回的板号为 None 表示「没写板号」，由界面下拉决定。
+    """
+    a = clean_address(addr)
+    if not a:
+        return None
+    if re.fullmatch(r"\d{1,3}", a):
+        return None, a
+    m = re.match(r"^(GPIB)[\s\-_]*(\d*)\s*(?:::|[,:]|\s)\s*(\d{1,3})\s*(::\w+)?$", a, re.I)
+    if not m:
+        return None
+    board = int(m.group(2)) if m.group(2) else None
+    return board, m.group(3)
+
+
+def build_gpib_resource(board, primary):
+    """板号 + 主地址 → 标准资源串（GPIB0::20::INSTR）。"""
+    return "GPIB%d::%s::INSTR" % (gpib_board_of(board), str(primary).strip())
+
+
+def gpib_primary_ok(primary):
+    """主地址是否在 0~30 的合法范围内。"""
+    s = str(primary or "").strip()
+    return bool(re.fullmatch(r"\d{1,3}", s)) and 0 <= int(s) <= GPIB_PRIMARY_MAX
+
+
+def gpib_primary_typing_ok(text):
+    """输入过程中的校验：GPIB 主地址只允许 0~2 位数字（0~30）。"""
+    s = str(text or "")
+    return s == "" or (s.isdigit() and len(s) <= 2)
+
+
+def split_gpib_cfg(addr, board=0):
+    """把配置里的地址拆成 (主地址, 板号)。
+
+    兼容旧配置写了完整资源串（GPIB1::20::INSTR → "20" + 1）；
+    只写数字时板号沿用传入值（界面上选的那个）。
+    """
+    parsed = parse_gpib_addr(addr)
+    if not parsed:
+        return clean_address(addr), gpib_board_of(board)
+    b, primary = parsed
+    return primary, (gpib_board_of(board) if b is None else b)
+
+
+def gpib_primary_only(value):
+    """把任意 GPIB 写法归一成主地址数字（20 / GPIB1::20::INSTR → "20"）。
+
+    无法识别时返回去空格的原值（由调用方决定是否采用）。
+    """
+    parsed = parse_gpib_addr(value)
+    if parsed:
+        return parsed[1]
+    return str(value or "").strip()
+
+
+def gpib_addr_mem(cfg, pre, default=""):
+    """取配置里「记住的 GPIB 主地址」（纯数字）。
+
+    新版写在 *_gpib_addr；旧配置可能把数字或资源串写在 *_ip 里，这里一并认，
+    保证升级后第一次切到 GPIB 也能自动回填。非法/空值回退 default。
+    """
+    src = cfg if isinstance(cfg, dict) else {}
+    val = str(src.get(pre + "_gpib_addr") or "").strip()
+    if not val:
+        cand = str(src.get(pre + "_ip") or "").strip()
+        if cand and link_mode_from_address(cand) == "GPIB":
+            val = cand
+    prim = gpib_primary_only(val)
+    return prim if re.fullmatch(r"\d{1,2}", prim) else str(default or "")
+
+
+def link_addr(cfg, pre):
+    """当前接口下实际使用的地址：GPIB → 主地址数字；LAN → IP/主机名。
+
+    日志、报告、校验都用它，避免 GPIB 模式下把 LAN 的 IP 当成仪表地址打印。
+    """
+    src = cfg if isinstance(cfg, dict) else {}
+    mode = str(src.get(pre + "_link") or "").strip().upper()
+    if mode not in LINK_MODES:
+        mode = link_mode_from_address(src.get(pre + "_ip", ""))
+    if mode == "GPIB":
+        return gpib_addr_mem(src, pre, CONFIG_DEFAULTS.get(pre + "_gpib_addr", ""))
+    return str(src.get(pre + "_ip") or "").strip()
+
+
+def link_tip(device, mode, extra=""):
+    """地址框的悬停提示：随【接口】下拉（LAN/GPIB）实时切换口径。
+
+    extra 只在 GPIB 模式下追加（通常是该型号的 GPIB 选件说明）。
+    """
+    if str(mode or "").strip().upper() == "GPIB":
+        lines = ["%s 的 GPIB 主地址：只填一个数字（0~30），如 20" % device,
+                 "• 板号在左侧【板号】下拉里选（GPIB0 = 1 号卡，GPIB1 = 2 号卡）",
+                 "• 不用写 GPIB0::20::INSTR，填 20 即可，避免拼错",
+                 "• GPIB 不需要 IP / 端口；【端口】只在 LAN 方式使用",
+                 "• 需本机已装 NI-VISA + NI-488.2（或 Keysight IO Libraries）"]
+        if extra:
+            lines.append("· " + extra)
+        return "\n".join(lines)
+    lines = ["%s 的 LAN 地址：填 IP，如 192.168.1.100" % device,
+             "• Raw Socket 直连，端口固定 5025（可在 config.json 的 *_port 改）",
+             "• 需与本机同网段、能 ping 通；填主机名也行",
+             "• 要用 GPIB 请把左侧【接口】切到 GPIB，地址改填数字"]
+    return "\n".join(lines)
+
+
+def link_desc(address, port=None):
+    """报告/日志里的地址展示：VISA 资源串原样，LAN 显示 ip:port。"""
+    a = clean_address(address)
+    if not a:
+        return "-"
+    if is_visa_address(a):
+        return normalize_visa_address(a)
+    if re.fullmatch(r"\d{1,3}", a):
+        # 只填了 GPIB 主地址（真机验证：地址框填 20 即可连上 CMW500），
+        # 报告里若显示成 "20:5025" 会误导排障，按资源串展示
+        return normalize_gpib_short(a)
+    host, prt = split_host_port(a, port if port not in (None, "") else "5025")
+    return "%s:%s" % (host, prt)
+
+
+def _visa_status_desc(status):
+    """把 ViStatus 数字转成可读文本（用于连接失败提示）。"""
+    try:
+        dll = _VISA_CACHE["dll"]
+        buf = ctypes.create_string_buffer(256)
+        if dll is not None and dll.viStatusDesc(_VISA_CACHE["rm"] or 0, status, buf) >= 0:
+            text = buf.value.decode("mbcs", "replace").strip()
+            if text:
+                return "%s (0x%08X)" % (text, status & 0xFFFFFFFF)
+    except Exception:
+        pass
+    return "ViStatus=0x%08X" % (status & 0xFFFFFFFF)
+
+
+def _load_visa():
+    """懒加载 visa32.dll 并打开默认资源管理器；失败时缓存错误文本。"""
+    if _VISA_CACHE["dll"] is not None:
+        return _VISA_CACHE["dll"], _VISA_CACHE["rm"]
+    if _VISA_CACHE["err"]:
+        raise ScpiError(_VISA_CACHE["err"])
+    dll = None
+    for name in ("visa32.dll", "visa64.dll"):
+        try:
+            dll = ctypes.WinDLL(name)
+            break
+        except OSError:
+            continue
+    if dll is None:
+        _VISA_CACHE["err"] = ("未找到 VISA 运行库（visa32.dll）——GPIB/USB 连接需要先安装 "
+                              "NI-VISA 或 Keysight IO Libraries，装完重启本工具即可")
+        raise ScpiError(_VISA_CACHE["err"])
+
+    ViSession = ctypes.c_uint32
+    ViStatus = ctypes.c_int32
+    ViUInt32 = ctypes.c_uint32
+    dll.viOpenDefaultRM.argtypes = [ctypes.POINTER(ViSession)]
+    dll.viOpenDefaultRM.restype = ViStatus
+    dll.viOpen.argtypes = [ViSession, ctypes.c_char_p, ViUInt32, ViUInt32,
+                           ctypes.POINTER(ViSession)]
+    dll.viOpen.restype = ViStatus
+    dll.viClose.argtypes = [ViSession]
+    dll.viClose.restype = ViStatus
+    dll.viSetAttribute.argtypes = [ViSession, ViUInt32, ctypes.c_uint32]
+    dll.viSetAttribute.restype = ViStatus
+    dll.viWrite.argtypes = [ViSession, ctypes.c_char_p, ViUInt32,
+                            ctypes.POINTER(ViUInt32)]
+    dll.viWrite.restype = ViStatus
+    dll.viRead.argtypes = [ViSession, ctypes.c_char_p, ViUInt32,
+                           ctypes.POINTER(ViUInt32)]
+    dll.viRead.restype = ViStatus
+    dll.viClear.argtypes = [ViSession]
+    dll.viClear.restype = ViStatus
+    dll.viStatusDesc.argtypes = [ViSession, ViStatus, ctypes.c_char_p]
+    dll.viStatusDesc.restype = ViStatus
+
+    rm = ViSession()
+    st = dll.viOpenDefaultRM(ctypes.byref(rm))
+    if st < 0:
+        _VISA_CACHE["err"] = ("VISA 资源管理器打开失败：%s（VISA 安装可能损坏，建议重装 "
+                              "NI-VISA / Keysight IO Libraries）" % _visa_status_desc(st))
+        raise ScpiError(_VISA_CACHE["err"])
+    _VISA_CACHE["dll"] = dll
+    _VISA_CACHE["rm"] = rm.value
+    return dll, rm.value
+
+
+def visa_available():
+    """系统是否具备可用的 VISA 运行库（不打开任何仪器）。"""
+    try:
+        _load_visa()
+        return True
+    except Exception:
+        return False
+
+
+class VisaTransport:
+    """VISA 传输层：接口与 ScpiTransport 一致（write/query/idn/close/connected），
+    上层测量逻辑无需改动，只换连接方式。适用于 GPIB/USB/TCPIP::INSTR 资源串。
+    """
+
+    def __init__(self, resource, timeout=10.0, eol="\n"):
+        self.resource = normalize_visa_address(resource)
+        self.timeout = float(timeout)
+        self.eol = eol
+        self.vi = None
+
+    # ---- 生命周期 ----
+    @property
+    def connected(self):
+        return self.vi is not None
+
+    def connect(self):
+        self.close()
+        dll, rm = _load_visa()
+        vi = ctypes.c_uint32()
+        st = dll.viOpen(rm, self.resource.encode("ascii", "ignore"),
+                        VI_NULL, VI_NULL, ctypes.byref(vi))
+        if st < 0:
+            hint = ""
+            if self.resource.upper().startswith("GPIB"):
+                hint = ("；GPIB 需先装 NI-488.2（或 Keysight GPIB 驱动）并接好 GPIB 接口卡，"
+                        "地址可在 NI-MAX 的 Devices and Interfaces 里确认")
+            raise ScpiError("VISA 打开 %s 失败：%s%s" % (
+                self.resource, _visa_status_desc(st), hint))
+        self.vi = vi.value
+        # 终止符与超时先设好再读 IDN，否则默认 TMO 可能长达数秒
+        dll.viSetAttribute(self.vi, VI_ATTR_TERMCHAR, 0x0A)
+        dll.viSetAttribute(self.vi, VI_ATTR_TERMCHAR_EN, VI_TRUE)
+        self._set_timeout(self.timeout)
+        try:
+            return self.idn()
+        except Exception:
+            return ""
+
+    def close(self):
+        if self.vi is not None:
+            try:
+                dll = _VISA_CACHE["dll"]
+                if dll is not None:
+                    dll.viClose(self.vi)
+            except Exception:
+                pass
+            self.vi = None
+
+    def _set_timeout(self, seconds):
+        if self.vi is None:
+            return
+        try:
+            ms = int(max(0.001, float(seconds)) * 1000)
+            _VISA_CACHE["dll"].viSetAttribute(self.vi, VI_ATTR_TMO_VALUE, ms)
+        except Exception:
+            pass
+
+    # ---- 读写 ----
+    def write(self, cmd):
+        if self.vi is None:
+            raise ScpiError("未连接")
+        data = (cmd.strip() + self.eol).encode("ascii", "ignore")
+        ret = ctypes.c_uint32()
+        st = _VISA_CACHE["dll"].viWrite(self.vi, data, len(data), ctypes.byref(ret))
+        if st < 0:
+            raise ScpiError("VISA 写失败：%s" % _visa_status_desc(st))
+
+    def _readline(self):
+        """读到终止符（\n）或 EOI 为止；超时转成 socket.timeout 与 LAN 通路一致。"""
+        dll = _VISA_CACHE["dll"]
+        out = bytearray()
+        while True:
+            buf = ctypes.create_string_buffer(4096)
+            ret = ctypes.c_uint32()
+            st = dll.viRead(self.vi, buf, 4096, ctypes.byref(ret))
+            if st < 0:
+                if st == VI_ERROR_TMO:
+                    raise socket.timeout("VISA 读超时")
+                raise ScpiError("VISA 读失败：%s" % _visa_status_desc(st))
+            out.extend(buf.raw[:ret.value])
+            # 收到终止符，或本次不足一个缓冲（EOI）即认为一条响应结束
+            if b"\n" in out or ret.value < 4096:
+                break
+        return out.decode("utf-8", "replace").strip()
+
+    def _discard_inflight(self):
+        """清掉在途/残留响应：VISA 的 viClear 对 GPIB 发 Selected Device Clear。"""
+        if self.vi is None:
+            return
+        try:
+            _VISA_CACHE["dll"].viClear(self.vi)
+        except Exception:
+            pass
+
+    def query(self, cmd, timeout=None, expect=None, retry=1):
+        """查询并读响应；retry>0 时超时后清缓冲重发（同 LAN 通路，见 ScpiTransport）。"""
+        if self.vi is None:
+            raise ScpiError("未连接")
+        old = self.timeout
+        tries = max(0, int(retry))
+        base = timeout if timeout is not None else old
+        try:
+            for attempt in range(tries + 1):
+                if timeout is not None or attempt:
+                    self._set_timeout(
+                        base if attempt == 0 else
+                        max(float(base or 10) * 2.0, float(base or 10) + 3.0))
+                try:
+                    self.write(cmd)
+                    resp = self._readline()
+                    if expect is not None and resp is not None \
+                            and not re.search(expect, resp):
+                        # 响应与命令语义不符 → 清设备缓冲后重发一次（同 LAN 通路）
+                        try:
+                            self._discard_inflight()
+                        except Exception:
+                            pass
+                        self.write(cmd)
+                        resp = self._readline()
+                    return resp
+                except socket.timeout:
+                    self._discard_inflight()
+                    if attempt >= tries:
+                        raise
+            raise socket.timeout("query 未执行")   # 理论不可达
+        finally:
+            try:
+                # 重试时把超时放大过，无论调用方是否显式传 timeout 都要还原，
+                # 否则后面所有查询都沿用被放大后的超时
+                self._set_timeout(old)
+            except Exception:
+                pass
+
+    def idn(self):
+        return self.query("*IDN?")
+
+
+def open_scpi(address, port=5025, timeout=10.0, eol="\n"):
+    """按地址形态选传输层：IP/主机名 → Raw Socket；VISA 资源串 → VISA。
+
+    返回 (transport, 描述串)，描述串用于日志（如 192.168.1.100:5025 / GPIB0::20::INSTR）。
+    port 允许是界面上的原始字符串：VISA 方式下不解析，LAN 方式下非法值回落 5025。
+    地址会先做全角/零宽清理，并把误写在一起的 "ip:端口" 拆开。
+    """
+    addr = clean_address(address)
+    if is_visa_address(addr):
+        res = normalize_visa_address(addr)
+        return VisaTransport(res, timeout=timeout, eol=eol), res
+    host, p = split_host_port(addr, port)
+    try:
+        port_n = int(str(p).strip() or 5025)
+    except (TypeError, ValueError):
+        port_n = 5025
+    return (ScpiTransport(host, port_n, timeout=timeout, eol=eol),
+            "%s:%d" % (host, port_n))
 
 
 # ----------------------------------------------------------------------------
@@ -892,6 +1505,20 @@ def all_band_channels(band, bw=None):
     return [("全", earfcn) for earfcn in range(lo, hi + 1)]
 
 
+def band_points_count(band, bw, full_scan=False):
+    """某 (频段,带宽) 的测试点数：全信道扫描=全部合法 EARFCN 数，否则=3 点。
+
+    界面上的「N 测试点」必须和 build_combos 实际枚举出来的组合数一致，
+    否则勾了全信道还显示 3 点，用户没法据此预估耗时。
+    """
+    try:
+        if full_scan:
+            return len(all_band_channels(band, bw))
+        return len(band_channels(band, bw))
+    except Exception:
+        return 0
+
+
 def build_combos(bands, band_bws, full_scan=False):
     """测试项 = 每个已选频段 × 该频段自己勾选的带宽 × 信道集。
 
@@ -958,22 +1585,448 @@ def build_channel_cmd(cfg, earfcn):
 RF_CONNECTORS = ["RF1C", "RF2C", "RF3C", "RF4C", "RFAC", "RFBC"]  # 手册 p.1524
 RX_CONNECTORS = ["RX1", "RX2"]
 
-PSU_CHANNELS = ("P6V", "P25V", "N25V")  # E36312A = CH1 / CH2 / CH3
+# 接收路径模式（灵敏度测试的三种天线口径）——以用户提供的 CMW500 路由表为准：
+#   模式       Scenario   RF Output(Connector/Converter)  RF Input(Connector/Converter)
+#   PRX        1cc 1+1    RF1COM / RFTX1                  RF1COM / RFRX1
+#   DRX        1cc 1+1    RF2COM / RFTX1                  RF1COM / RFRX1
+#   PRX+DRX    1cc n+m2   RF1COM/RFTX1 + RF2COM/RFTX3     RF1COM / RFRX1
+# 手册依据: 23.5.4 Signal Routing p.1741~1743（SCEL/MIMO22）；
+# MIMO22 下 FETC:EBLer:REL? 返回两流合并总体 Throughput（p.1773），扫描判据无需分叉。
+RX_PATH_MODES = ("prx", "drx", "prx_drx")
+RX_PATH_LABELS = {
+    # 不再写死 RF1C/RF2C：换到 RF3COM/RF4COM 后旧文案会误导（日志里曾出现
+    # 「主集 PRX（RF1C）」而实际走 RF3C）。端口统一由【RF口】组合与映射表体现。
+    "prx": "主集 PRX",
+    "drx": "分集 DRX",
+    "prx_drx": "主集+分集 PRX+DRX（MIMO2x2）",
+}
+# 路由/校准的唯一真源：端口由模式决定，界面不再提供 RF口/RX 手动选择。
+RX_PATH_ROUTES = {
+    "prx": "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF1C,TX1",
+    "drx": "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF2C,TX1",
+    "prx_drx": "ROUT:LTE:SIGN:SCEN:MIMO22 RF1C,RX1,RF1C,TX1,RF2C,TX3",
+}
+RX_PATH_TX_PORTS = {"prx": ("RF1C",), "drx": ("RF2C",),
+                    "prx_drx": ("RF1C", "RF2C")}
+RX_PATH_RX_PORT = "RF1C"       # FDC RX 校准：三种模式上行连接器均为 RF1COM
+RX_PATH_RX_CONVERTER = "RX1"   # 路由命令中的上行转换器 RFRX1 / cfg["rx"]
+RX_PATH_DESC = {
+    "prx": "下行 RF1COM/RFTX1；上行 RF1COM/RFRX1",
+    "drx": "下行 RF2COM/RFTX1；上行 RF1COM/RFRX1",
+    "prx_drx": "下行 RF1COM/RFTX1 + RF2COM/RFTX3；上行 RF1COM/RFRX1",
+}
+# 下拉显示串（放在 RX 指标区），内部仍以 prx/drx/prx_drx 存储
+# 只显示模式名：端口由【RF口】下拉体现，避免长端口串把设置行撑超窗口
+RX_PATH_UI = {
+    "prx": "PRX 主集",
+    "drx": "DRX 分集",
+    "prx_drx": "PRX+DRX 双流",
+}
+RX_PATH_UI_TO_MODE = {v: k for k, v in RX_PATH_UI.items()}
+# 动态显示串的固定前缀（端口改了以后仍能由下拉串反查模式）
+RX_PATH_UI_PREFIX = {
+    "prx": "PRX 主集", "drx": "DRX 分集", "prx_drx": "PRX+DRX 双流",
+}
+
+# ===== RF 口组合（换口只选一次，三种模式自动展开）=====
+# CMW500 的 4 个 RF COM 口只需按「主集 / 分集」两行描述：
+#   main = (上行连接器, 该口下行转换器, 该口上行转换器)
+#   div  = (分集连接器, 第二流下行转换器)
+# 展开规则（与真机日志逐条对齐，见 selftest 断言）：
+#   PRX      SCEL   上行 main.rx,  下行 main.tx @ main.conn
+#   DRX      SCEL   上行 main.rx,  下行 main.tx @ div.conn  （主集转换器打到分集口）
+#   PRX+DRX  MIMO22 上行 main.rx,  下行 main.tx@main.conn + div.tx@div.conn
+# 换口时只需在下拉里换一组，或在 config.json 里改 rf_port_combo / rf_port_main /
+# rf_port_div 三行，不再手改 6 处端口容易错。
+RF_PORT_COMBOS = {
+    "RF1+RF2": {"desc": "RF1COM 主集 + RF2COM 分集（RFTX1/RFTX3，RFRX1）",
+                "main": ("RF1C", "TX1", "RX1"), "div": ("RF2C", "TX3")},
+    "RF3+RF4": {"desc": "RF3COM 主集 + RF4COM 分集（RFTX2/RFTX4，RFRX2）",
+                "main": ("RF3C", "TX2", "RX2"), "div": ("RF4C", "TX4")},
+}
+RF_PORT_COMBO_CUSTOM = "自定义"   # 端口与两套预设都不符时下拉显示这一项
+RX_PATH_MODE_SHORT = {"prx": "PRX", "drx": "DRX", "prx_drx": "PRX+DRX"}
+
+
+def rf_ports_from_combo(name):
+    """「主集/分集」两行 → 三种模式的 rx_path_ports 结构；未知组合返回 None。"""
+    c = RF_PORT_COMBOS.get(str(name or "").strip())
+    if not c:
+        return None
+    mc, mt, mr = c["main"]
+    dc, dt = c["div"]
+    return {
+        "prx": {"scenario": "SCEL", "rx": [mc, mr], "tx": [[mc, mt]]},
+        "drx": {"scenario": "SCEL", "rx": [mc, mr], "tx": [[dc, mt]]},
+        "prx_drx": {"scenario": "MIMO22", "rx": [mc, mr],
+                    "tx": [[mc, mt], [dc, dt]]},
+    }
+
+
+def combo_of_ports(ports):
+    """反查当前端口表属于哪套组合；自定义返回 None。"""
+    cur = normalize_rx_path_ports(ports)
+    for name in RF_PORT_COMBOS:
+        if normalize_rx_path_ports(rf_ports_from_combo(name)) == cur:
+            return name
+    return None
+
+
+def rf_path_rows(cfg=None):
+    """当前生效配置的 RF 路径表（下拉提示 / 日志 / 弹窗共用同一数据源）。"""
+    ports = rx_ports_cfg(cfg)
+    rows = []
+    for m in RX_PATH_MODES:
+        p = ports[m]
+        down = " + ".join("%sCOM/RF%s" % (c[:-1], v) for c, v in p["tx"])
+        rc, rv = p["rx"]
+        rows.append({
+            "mode": RX_PATH_MODE_SHORT[m],
+            "scenario": p["scenario"],
+            "down": down,
+            "up": "%sCOM/RF%s" % (rc[:-1], rv),
+            "fdc_tx": ", ".join(c for c, _v in p["tx"]),
+            "fdc_rx": rc,
+            "route": rx_route_from_ports(m, ports),
+        })
+    return rows
+
+
+def rf_path_table_text(cfg=None):
+    """等宽表格文本（全 ASCII，Consolas 下逐列对齐），供下拉提示与日志使用。"""
+    rows = rf_path_rows(cfg)
+    head = ("MODE", "SCEN", "DOWNLINK (RF Out)", "UPLINK (RF In)")
+    body = [(r["mode"], r["scenario"], r["down"], r["up"]) for r in rows]
+    w = [max([len(head[i])] + [len(b[i]) for b in body]) for i in range(4)]
+    fmt = "  ".join("%%-%ds" % x for x in w)
+    return "\n".join([fmt % head] + [fmt % b for b in body])
+
+
+def rf_path_tip(cfg=None):
+    """下拉悬停提示：表格 + 组合来源 + FDC 校准口（随选择实时生成）。"""
+    combo = combo_of_cfg(cfg)
+    if combo:
+        src = "组合 %s：%s" % (combo, RF_PORT_COMBOS[combo]["desc"])
+    else:
+        src = "自定义端口（config.json 的 rx_path_ports）"
+    ports = rx_ports_cfg(cfg)
+    tx_ports = []
+    for m in RX_PATH_MODES:
+        for c, _v in ports[m]["tx"]:
+            if c not in tx_ports:
+                tx_ports.append(c)
+    return "%s\n\n%s\nFDC 校准口：TX=%s / RX=%s" % (
+        src, rf_path_table_text(cfg), "/".join(tx_ports), ports["prx"]["rx"][0])
+
+# ===== 结构化 RF 口配置（config.json 的 rx_path_ports）=====
+# 每种模式列出场景、上行(连接器,转换器)、下行(连接器,转换器)列表；
+# 程序据此生成 SCPI 路由命令、FDC 校准口、下拉显示串与悬停描述。
+# 用户只需在“参数配置”里改端口名，运行时自动检测文件变化并刷新下拉。
+RX_PATH_PORTS_DEFAULT = {
+    "prx":     {"scenario": "SCEL",   "rx": ["RF1C", "RX1"],
+                "tx": [["RF1C", "TX1"]]},
+    "drx":     {"scenario": "SCEL",   "rx": ["RF1C", "RX1"],
+                "tx": [["RF2C", "TX1"]]},
+    "prx_drx": {"scenario": "MIMO22", "rx": ["RF1C", "RX1"],
+                "tx": [["RF1C", "TX1"], ["RF2C", "TX3"]]},
+}
+_TX_CONVERTER_RE = re.compile(r"^TX[1-9]\d*$")
+
+
+def _valid_connector(v):
+    return str(v or "").strip().upper() in RF_CONNECTORS
+
+
+def normalize_rx_path_ports(value):
+    """校验/归一化 rx_path_ports；非法字段回退到该模式的默认值。
+
+    返回 {mode: {"scenario": str, "rx": (conn, conv), "tx": ((conn, conv), ...)}}。
+    scenario 由模式决定（prx/drx=SCEL, prx_drx=MIMO22），配置里的值仅作备注；
+    TX 路数 prx/drx=1、prx_drx=2，转换器须为 TXn，连接器须在 RF 连接器表内。
+    """
+    raw = value if isinstance(value, dict) else {}
+    out = {}
+    for mode in RX_PATH_MODES:
+        dflt = RX_PATH_PORTS_DEFAULT[mode]
+        item = raw.get(mode)
+        item = item if isinstance(item, dict) else {}
+        scenario = "MIMO22" if mode == "prx_drx" else "SCEL"
+
+        rx = item.get("rx")
+        rx_pair = None
+        if isinstance(rx, (list, tuple)) and len(rx) == 2:
+            conn = str(rx[0] or "").strip().upper()
+            conv = str(rx[1] or "").strip().upper()
+            if conn in RF_CONNECTORS and conv in RX_CONNECTORS:
+                rx_pair = (conn, conv)
+        if rx_pair is None:
+            rx_pair = tuple(dflt["rx"])
+
+        want_n = 2 if mode == "prx_drx" else 1
+        tx_list = item.get("tx")
+        tx_pairs = []
+        if isinstance(tx_list, (list, tuple)) and len(tx_list) == want_n:
+            for pair in tx_list:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    tx_pairs = []
+                    break
+                conn = str(pair[0] or "").strip().upper()
+                conv = str(pair[1] or "").strip().upper()
+                if conn not in RF_CONNECTORS or not _TX_CONVERTER_RE.match(conv):
+                    tx_pairs = []
+                    break
+                tx_pairs.append((conn, conv))
+        if len(tx_pairs) != want_n:
+            tx_pairs = [tuple(p) for p in dflt["tx"]]
+
+        out[mode] = {"scenario": scenario, "rx": rx_pair,
+                     "tx": tuple(tx_pairs)}
+    return out
+
+
+def rx_ports_cfg(cfg=None):
+    """取 cfg 中已归一化的端口表。
+
+    优先级：rf_port_combo（组合预设）> rx_path_ports（手写端口表）> 默认表。
+    组合存在时按「主集/分集」两行展开，保证三种模式的口径永远自洽。
+    """
+    src = cfg if isinstance(cfg, dict) else None
+    if src:
+        combo = rf_ports_from_combo(src.get("rf_port_combo"))
+        if combo:
+            return normalize_rx_path_ports(combo)
+    raw = src.get("rx_path_ports") if src else None
+    return normalize_rx_path_ports(raw)
+
+
+def combo_of_cfg(cfg=None):
+    """当前生效配置对应的 RF 口组合名；两套预设都不符时返回 None（自定义）。"""
+    if isinstance(cfg, dict):
+        name = str(cfg.get("rf_port_combo") or "").strip()
+        if name in RF_PORT_COMBOS:
+            return name
+    return combo_of_ports(rx_ports_cfg(cfg))
+
+
+def rx_route_from_ports(mode, ports):
+    """由结构化端口生成完整路由命令（手册 23.5.4 p.1741~1743）。"""
+    m = norm_rx_path(mode)
+    p = ports[m]
+    rx_conn, rx_conv = p["rx"]
+    tail = ",".join("%s,%s" % (c, v) for c, v in p["tx"])
+    return "ROUT:LTE:SIGN:SCEN:%s %s,%s,%s" % (
+        p["scenario"], rx_conn, rx_conv, tail)
+
+
+def rx_display_from_ports(mode, ports):
+    """下拉显示串：只显示接收模式。
+
+    端口不再塞进本下拉（原来「PRX+DRX 双流（RF3C+RF4C）」要 33 字符，会把
+    终测仪那一行撑到超出窗口），改由右侧【RF口】下拉体现当前组合，完整映射表
+    放在本下拉与【RF口】的悬停提示里。
+    """
+    return RX_PATH_UI_PREFIX[norm_rx_path(mode)]
+
+
+def rx_desc_from_ports(mode, ports):
+    """悬停描述：下行/上行的连接器与转换器，随配置变化。"""
+    m = norm_rx_path(mode)
+    p = ports[m]
+    down = " + ".join("%sCOM/RF%s" % (c[:-1], v) for c, v in p["tx"])
+    rc, rv = p["rx"]
+    return "下行 %s；上行 %sCOM/RF%s" % (down, rc[:-1], rv)
+
+
+def norm_rx_path(value):
+    """归一化接收路径模式；未知值回退 prx（保证旧 config 向后兼容）。"""
+    v = str(value or "prx").strip().lower()
+    return v if v in RX_PATH_MODES else "prx"
+
+
+def rx_path_from_ui(value):
+    """界面下拉显示串 → 内部模式；兼容动态端口显示串与旧 config 值。"""
+    v = str(value or "").strip()
+    if v in RX_PATH_UI_TO_MODE:
+        return RX_PATH_UI_TO_MODE[v]
+    for mode, prefix in RX_PATH_UI_PREFIX.items():
+        if v.startswith(prefix):
+            return mode
+    return norm_rx_path(v)
+
+
+def _has_ports_cfg(cfg):
+    """cfg 是否给了端口信息（组合预设或手写端口表任一即可）。"""
+    if not isinstance(cfg, dict):
+        return False
+    return bool(rf_ports_from_combo(cfg.get("rf_port_combo"))
+                or isinstance(cfg.get("rx_path_ports"), dict))
+
+
+def rx_path_display(mode, cfg=None):
+    """下拉显示串：优先从 cfg 的端口配置派生，缺省用静态默认串。"""
+    ports = rx_ports_cfg(cfg)
+    if _has_ports_cfg(cfg):
+        return rx_display_from_ports(mode, ports)
+    return RX_PATH_UI.get(norm_rx_path(mode), RX_PATH_UI["prx"])
+
+
+def rx_path_label(mode):
+    return RX_PATH_LABELS.get(norm_rx_path(mode), RX_PATH_LABELS["prx"])
+
+
+def rx_path_desc(mode, cfg=None):
+    """悬停/报告描述：优先从 cfg 的端口配置动态派生。"""
+    if _has_ports_cfg(cfg):
+        return rx_desc_from_ports(mode, rx_ports_cfg(cfg))
+    return RX_PATH_DESC.get(norm_rx_path(mode), RX_PATH_DESC["prx"])
+
+
+def rx_path_ports(mode, cfg=None):
+    """由模式派生 cfg 中 rf(连接器)/rx(转换器) 字段，仅用于报告/日志展示。"""
+    m = norm_rx_path(mode)
+    if _has_ports_cfg(cfg):
+        p = rx_ports_cfg(cfg)[m]
+        return p["tx"][0][0], p["rx"][1]
+    return RX_PATH_TX_PORTS[m][0], RX_PATH_RX_CONVERTER
+
+
+def build_rx_route_commands(cfg):
+    """按接收路径模式返回信号路由命令（手册 23.5.4 p.1741~1743）。
+
+    映射严格按用户提供的路由表（PRX/DRX = 1cc 1+1，PRX+DRX = 1cc n+m2）：
+      prx     -> SCEL RF1C,RX1,RF1C,TX1
+      drx     -> SCEL RF1C,RX1,RF2C,TX1
+      prx_drx -> MIMO22 RF1C,RX1,RF1C,TX1,RF2C,TX3
+    PRX+DRX 第二路用 RFTX3（与 RFTX1 不同 TX 模块）；此前 RF2C,TX2 被真机拒绝。
+    """
+    mode = norm_rx_path(cfg.get("rx_path"))
+    if _has_ports_cfg(cfg):
+        return [rx_route_from_ports(mode, rx_ports_cfg(cfg))]
+    return [RX_PATH_ROUTES[mode]]
+
+
+def is_mimo_rx(cfg):
+    return norm_rx_path(cfg.get("rx_path")) == "prx_drx"
+
+
+def build_transmission_mode_commands(cfg):
+    """传输模式：PRX+DRX(MIMO2x2) 灵敏度按 3GPP TS 36.521-1 第7章选 TM1。
+
+    CMW500 手册 p.1685：MIMO2x2 场景默认 Mode 3 / DCI 2A（开环空间复用，用于
+    吞吐量测试）；但接收机灵敏度 REFSENS 属第 7 章接收机测试，规定用 TM1
+    （单端口 port 0，两路下行发相同数据、UE 主集+分集天线接收合并）——这才是
+    PRX+DRX 口径。新版 Command Reference（CMW-KM5xx）命令：
+        CONFigure:LTE:SIGN:CONNection:TRANsmission TM1
+    必须在路由（激活场景）之后下发；TM1 不需要 KS520 选件。
+    单路 PRX/DRX 保持仪表默认（本就是 TM1），不下发，避免影响已验证流程。
+    """
+    if is_mimo_rx(cfg):
+        return ["CONF:LTE:SIGN:CONN:TRANsmission TM1"]
+    return []
+
+
+def dl_stream_suffix(cfg):
+    """MIMO 模式下下行 RMC/UDCH/RBP 需要 <Stream> 后缀 1|2；单路返回空串。"""
+    return ("1", "2") if is_mimo_rx(cfg) else ("", "")
+
+
+def build_dl_rmc_commands(cfg, rb, mod):
+    """下行 RMC + RBPosition 命令；MIMO 下双流各配一条（手册 p.1763/p.1765）。
+
+    单路：CONF:LTE:SIGN:CONN:RMC:DL <rb>,<mod>,KEEP / RBP:DL LOW
+    双流：...:RMC:DL1 ... / DL2 ... / RBP:DL1 LOW / RBP:DL2 LOW
+    手册要求两流的 RB 数、调制、RB 位置一致，故同值下发。
+    """
+    p = "LTE:SIGN"
+    s1, s2 = dl_stream_suffix(cfg)
+    out = ["CONF:%s:CONN:RMC:DL%s %s,%s,KEEP" % (p, s1, rb, mod)]
+    if s2:
+        out.append("CONF:%s:CONN:RMC:DL%s %s,%s,KEEP" % (p, s2, rb, mod))
+    out.append("CONF:%s:CONN:RMC:RBP:DL%s LOW" % (p, s1))
+    if s2:
+        out.append("CONF:%s:CONN:RMC:RBP:DL%s LOW" % (p, s2))
+    return out
+
+
+def build_dl_udch_command(cfg, rb):
+    """下行 UDCH 命令；MIMO 下需给两个流各配一条（手册 p.1766）。"""
+    p = "LTE:SIGN"
+    s1, s2 = dl_stream_suffix(cfg)
+    out = ["CONF:%s:CONN:UDCH:DL%s %d,0,QPSK,KEEP" % (p, s1, rb)]
+    if s2:
+        out.append("CONF:%s:CONN:UDCH:DL%s %d,0,QPSK,KEEP" % (p, s2, rb))
+    return out
+
+
+def build_eatt_output_commands(cfg, loss):
+    """下行外部衰减命令：统一用无后缀 EATT:OUTP。
+
+    手册 p.1744 的 OUTP1/OUTP2 双流后缀在真机 CMW500 固件 3.8.10 上被拒绝
+    （-138 "Suffix not allowed"），该机型只有一条输出衰减路径，故所有模式
+    （含 MIMO）均下发单条无后缀 OUTP，由硬件对两路同等生效。
+    """
+    p = "LTE:SIGN"
+    return ["CONF:%s:RFS:EATT:OUTP %s" % (p, _fmt_db(loss))]
+
+
+# E36312A = CH1/CH2/CH3。CH3 的 SCPI 标识符仍是 N25V（E36300 Programming Guide
+# "Programming Ranges" 表），但正常模式下 E36312A/E36313A 的 CH3 输出 +25V；
+# 只有 E36311A 或 SCPI ID 设为 E3631A 的兼容模式才是 -25V。故按 E36312A 取正电压。
+PSU_CHANNELS = ("P6V", "P25V", "N25V")
 PSU_VOLT_RANGE = {
     "P6V": (0.0, 6.18, "0 ~ 6.18 V"),
     "P25V": (0.0, 25.75, "0 ~ +25.75 V"),
-    "N25V": (-25.75, 0.0, "-25.75 ~ 0 V"),
+    "N25V": (0.0, 25.75, "0 ~ +25.75 V"),
 }
 PSU_DEFAULT_SAMPLES = 3
 
 # 结果目录
 RESULT_DIR = os.path.join(APP_DIR, "result")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+# 断点续测：state\checkpoint.json 保存「最近一次未跑完的测量」，每测完一个
+# 组合原子写一次；工具启动时若发现它且配置一致，就倒计时自动接着测。
+STATE_DIR = os.path.join(APP_DIR, "state")
+CHECKPOINT_PATH = os.path.join(STATE_DIR, "checkpoint.json")
+CHECKPOINT_VERSION = 1
 
 CONFIG_DEFAULTS = {
-    "cmw_ip": "192.168.1.100", "cmw_port": "5025",
-    "rf": "RF1C", "rx": "RX1",
-    "psu_enable": True, "psu_ip": "", "psu_port": "5025",
+    "instrument": "CMW500", "psu_model": "E36312A",  # 仪表/电源型号下拉（预留扩展）
+    # *_ip 只存 LAN 地址（IPv4/主机名，配合 *_port）；*_gpib_addr 只存 GPIB 主地址数字，
+    # 板号放在 *_gpib_board（0 = 第 1 块 GPIB 卡）。两个槽互不覆盖：
+    # 接口下拉在 LAN / GPIB 间切换时自动回填各自上次用过的地址，不用重新输入。
+    # 旧的完整资源串（GPIB1::20::INSTR）仍可识别并自动拆成主地址 + 板号。
+    "cmw_ip": "192.168.1.100", "cmw_port": "5025", "cmw_link": "LAN",
+    "cmw_gpib_board": 0,
+    "cmw_gpib_addr": "20",      # CMW500 出厂 GPIB 主地址，切到 GPIB 自动回填
+    "rf": "RF1C", "rx": "RX1", "rx_path": "prx",
+    # 结构化 RF 口：参数配置里改端口名，程序自动生成路由/FDC/下拉显示
+    "rx_path_ports": {m: {"scenario": p["scenario"],
+                          "rx": list(p["rx"]),
+                          "tx": [list(t) for t in p["tx"]]}
+                      for m, p in RX_PATH_PORTS_DEFAULT.items()},
+    "psu_enable": True, "psu_ip": "", "psu_port": "5025", "psu_link": "LAN",
+    "psu_gpib_board": 0,
+    "psu_gpib_addr": "5",       # Keysight E36312A 出厂 GPIB 主地址，切到 GPIB 自动回填
+    # 电源采样策略（对测试速度影响 <1%，主要影响日志量与电源口往返次数）：
+    #   tx_only = 有 TX 指标（maxpower/aclr/evm/freqerr）才逐组合采，纯 RX 只在开跑前采 1 次
+    #   always  = 保持旧行为（每个组合都采 Pmax/Pmin 两档电流）
+    #   off     = 运行期完全不采（仍保留开跑前那一次待机快照）
+    "psu_read_mode": "tx_only",
+    # 断点续测（state\checkpoint.json）：每测完一个组合就落一次断点，
+    # 工具启动时若发现未完成断点且配置一致 → 倒计时结束后自动初始化并接着测。
+    # auto_resume=0 则只在点【开始测量】时询问，不自动开跑；
+    # auto_resume_max_hours 限制断点最长自动续测时长（0 = 不限制）。
+    "auto_resume": True,
+    "auto_resume_delay": "10",
+    "auto_resume_max_hours": "72",
+    # 过程中同步保存：每测完一个组合就把已完成结果刷到
+    # result\LTE_<stamp>_partial.txt（<10ms），xlsx 按 partial_every 个
+    # 组合或 partial_interval 秒限频重建（整表重建，跑完自动删除这两个文件）。
+    # 7096 行时整表重建约 4s，故默认 50 组合/10 分钟，累计开销约 0.3%。
+    # partial_save=false 可整体关掉。
+    "partial_save": True,
+    "partial_every": "50",      # 每 N 个组合刷一次 xlsx（1 = 每组合都刷，很慢）
+    "partial_interval": "600",  # 或距上次刷新满 N 秒（与 N 个组合先到为准）
     "psu_channel": "P6V", "psu_voltage": "3.800", "psu_readv": True,
     "freq": "1850", "enp": "23", "eatt": "0", "umar": "3",
     # 每个频段独立选择的带宽 {band: [bw, ...]}；bws 仅作兼容/汇总字段
@@ -983,9 +2036,13 @@ CONFIG_DEFAULTS = {
     "rsrp": "-85", "pmax": "23", "dl_rb": "N50", "dl_mod": "QPSK",
     # FDC 频率响应校准表（ASRrun V2.0.7 对比参考）。按频率分段补偿线缆/连接器损耗，
     # 仪器自动根据当前测试频率从表中查表插值。格式：freq_MHz:loss_dB 逗号分隔，频率严格递增。
-    # 默认值为通用射频线缆的经验值（450~3600MHz 0.3~1.0dB 分段），请根据实际线缆长度/材质校准。
+    # 粗粒度经验值（1 位小数）：≤1 GHz 0.3 dB、1.x~2.2 GHz 0.5 dB（含 B1）、
+    # 2.3 GHz 以上 0.7 dB、3.5 GHz 1.0 dB、5 GHz 段 1.5 dB；
+    # 请按实际线缆长度/材质在 config.json 里微调。
     # 设为空字符串或 false 可关闭 FDC。
-    "freq_loss_segments": "450:0.3, 800:0.3, 1000:0.5, 1500:0.5, 2000:0.7, 2500:0.7, 3600:1.0",
+    "freq_loss_segments": (
+        "410:0.3, 1000:0.3, 1500:0.5, 2200:0.5, 2300:0.7, "
+        "2700:0.7, 3500:1.0, 3800:1.0, 5150:1.5, 5925:1.5"),
     "freq_loss_enable": True,
     # 灵敏度口径：仪器设置/扫描的是 RS EPRE (dBm/15kHz)，报告换算为 Full Cell BW Pow (dBm)
     #   FullCellBW = RS_EPRE + 10log10(12*N_RB)，N_RB=6/15/25/50/75/100 (1.4/3/5/10/15/20MHz)
@@ -1039,8 +2096,13 @@ CONFIG_DEFAULTS = {
     # ASRrun V2.0.7 对比参考：600 子帧 ≈ 6 秒/点，比 1000 子帧省 40% 时间，
     # 拐点处 BLER 从 0→10% 跃迁远大于 600/1000 子帧统计误差。
     "bler_subframes": "600", "bler_timeout": "10",
-    # TPC MAXPower 后 UE 升功率需要稳定；真机偶发 Rel=3 Overdriven，2s→4s。
-    "tpc_settle": "4", "stats": "20",
+    # 灵敏度扫描的 BLER 状态轮询间隔（秒）：STAT? 查询很轻，0.3s 会让每个测量点
+    # 平均多等 0.15s（15 点/组合 ≈ 1.5s）。真机若出现查询拥塞可调回 0.3。
+    "sens_poll": "0.15",
+    # TPC 换挡后 UE 升/降功率需要稳定。历史：2s 时偶发 Rel=3 Overdriven 无效测量，
+    # 曾加到 4s；现取 2.5s（真机实测 2.5s 已稳定），无效测量仍由 3 次重试兜底。
+    # 每组合两个功率档，2.5s 比 4s 省 3s（约 11% 总时长）。
+    "tpc_settle": "2.5", "stats": "20",
     # 切信道重同步/测量重试（手册 p.1681：切信道使连接进入 Signaling in Progress，
     # UE 需重新同步才可能被调度上行发射）。仅走配置默认值，不在界面显示。
     "chan_settle": "1.5", "mev_retry": "2", "mev_retry_gap": "1.0",
@@ -1073,35 +2135,107 @@ CONFIG_DEFAULTS = {
     "power_scenario": "high",
     "sens_power_mode": "high",
     "sens_low_power": "",  # Pmin 场景的 CLOop dBm（空 → UE 最小发射功率；填值 → CLOop 功率，范围 -50~23）
+    # Pmin 档续扫时是否跳过 EBLer warmup（1=跳过，省约 0.7s/信道；0=每次都预同步）。
+    # 只有「该功率档已在本频段测过信道」时才可能跳过，切档后首次测量始终 warmup。
+    "sens_skip_warmup_low": "1",
     # 全信道扫描：勾选后每个 (频段,带宽) 枚举全部合法 DL EARFCN，逐信道探底灵敏度
     "full_scan": False,
     "metrics": {k: True for k in METRIC_KEYS},
 }
 
 
-def load_config():
+def normalize_cfg(data):
+    """把任意 dict（config.json 内容 / 外部热重载数据）归一化成完整配置。
+
+    与读盘解耦，便于自检直接喂小字典验证 RF 口组合、场景、指标等派生逻辑。
+    """
     out = dict(CONFIG_DEFAULTS)
     out["metrics"] = dict(CONFIG_DEFAULTS["metrics"])
-    try:
-        if os.path.isfile(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k, v in data.items():
-                out[k] = v
-            m = dict(CONFIG_DEFAULTS["metrics"])
-            m.update(data.get("metrics") or {})
-            out["metrics"] = m
-    except Exception:
-        pass
+    if isinstance(data, dict):
+        for k, v in data.items():
+            out[k] = v
+        m = dict(CONFIG_DEFAULTS["metrics"])
+        m.update(data.get("metrics") or {})
+        out["metrics"] = m
+    # 接收路径模式：非法/缺失值归一化为 prx（旧配置文件无此键时保持原行为）
+    out["rx_path"] = norm_rx_path(rx_path_from_ui(out.get("rx_path")))
+    # RF 口组合：写了 rf_port_combo 就按「主集/分集」两行展开（覆盖 rx_path_ports）；
+    # 留空则沿用 rx_path_ports 手写端口，兼容旧配置与自定义接法。
+    _combo = str(out.get("rf_port_combo") or "").strip()
+    if _combo in RF_PORT_COMBOS:
+        out["rf_port_combo"] = _combo
+        out["rx_path_ports"] = normalize_rx_path_ports(rf_ports_from_combo(_combo))
+    else:
+        out["rf_port_combo"] = ""
+        # 结构化 RF 口：缺省用默认表；用户改过的端口逐项校验，非法字段回退默认
+        out["rx_path_ports"] = normalize_rx_path_ports(out.get("rx_path_ports"))
+    # RF口/RX 按配置派生（兼容旧 config 里残留的 rf/rx 值）
+    out["rf"], out["rx"] = rx_path_ports(out["rx_path"], out)
     # 测试场景：新键 power_scenario 与旧键 sens_power_mode 双向兼容
     if "power_scenario" in out:
         out["sens_power_mode"] = out["power_scenario"]
     else:
         out["power_scenario"] = out.get("sens_power_mode", "high")
+    # 记住的 GPIB 主地址：缺失/非法时补默认值（20 / 5），旧版写在 *_ip 的也能迁过来
+    for _pre in ("cmw", "psu"):
+        out[_pre + "_gpib_addr"] = gpib_addr_mem(
+            out, _pre, CONFIG_DEFAULTS.get(_pre + "_gpib_addr", ""))
     # 保证 metrics 覆盖全部指标键
     for k in METRIC_KEYS:
         out["metrics"].setdefault(k, True)
     return out
+
+
+def load_config():
+    """读 config.json 并归一化；读不到/解析失败时用默认配置。"""
+    data = {}
+    try:
+        if os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    except Exception:
+        data = {}
+    return normalize_cfg(data)
+
+
+def ensure_config_rx_ports():
+    """启动时检查 config.json：缺 rx_path_ports / *_gpib_addr 则只补这些字段并写回。
+
+    这样旧配置文件（新版本之前生成的）在工具启动后就能在“参数配置”里看到
+    RF 口与「记住的 GPIB 地址」字段，用户无需手工添加。已有完整字段时绝不改动文件。
+    """
+    try:
+        if not os.path.isfile(CONFIG_PATH):
+            return False
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        changed = False
+        raw = data.get("rx_path_ports")
+        if not (isinstance(raw, dict) and all(m in raw for m in RX_PATH_MODES)):
+            data["rx_path_ports"] = {
+                m: {"scenario": p["scenario"], "rx": list(p["rx"]),
+                    "tx": [list(t) for t in p["tx"]]}
+                for m, p in RX_PATH_PORTS_DEFAULT.items()}
+            changed = True
+        # GPIB 主地址：缺失时补出厂默认（CMW500 = 20，E36312A = 5），
+        # 下次打开工具 / 切到 GPIB 就能直接连，不用重新输入
+        for pre in ("cmw", "psu"):
+            key = pre + "_gpib_addr"
+            if str(data.get(key) or "").strip():
+                continue
+            if link_mode_from_address(data.get(pre + "_ip", "")) == "GPIB":
+                continue   # 旧配置把 GPIB 地址写在 *_ip 里，交给 gpib_addr_mem 迁移
+            data[key] = CONFIG_DEFAULTS[key]
+            changed = True
+        if not changed:
+            return False   # 已有完整字段：不动文件
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def save_config(cfg):
@@ -1111,6 +2245,150 @@ def save_config(cfg):
         return True
     except Exception:
         return False
+
+
+# ----------------------------------------------------------------------------
+# 断点续测（checkpoint）
+# ----------------------------------------------------------------------------
+def resume_fingerprint(cfg):
+    """断点指纹：只覆盖「一变就必须从头测」的配置项。
+
+    频段×带宽×信道组合表是核心；指标勾选、功率场景、接收路径 / RF 口组合、
+    灵敏度窗口与判定门限、BLER 子帧数任一不同，已完成的那批数据都与新口径
+    不可比 —— 宁可从头跑，也绝不把两套口径拼进同一份报告。
+    """
+    parts = {
+        "combos": [[str(x) for x in c] for c in (cfg.get("combos") or [])],
+        "band_bws": {str(b): [str(w) for w in (ws or [])]
+                     for b, ws in (cfg.get("band_bws") or {}).items()},
+        "metrics": sorted(k for k, v in (cfg.get("metrics") or {}).items() if v),
+        "scenario": str(cfg.get("power_scenario") or ""),
+        "low_power": str(cfg.get("sens_low_power") or ""),
+        "rx_path": str(cfg.get("rx_path") or ""),
+        "combo": str(cfg.get("rf_port_combo") or ""),
+        "throughput": str(cfg.get("sens_throughput") or ""),
+        "limits": [str(cfg.get(k) or "") for k in
+                   ("evm_lim", "aclr_lim", "freq_lim", "sens_lim")],
+        "sens": [str(cfg.get(k) or "") for k in
+                 ("sens_start", "sens_stop", "sens_step", "sens_near",
+                  "sens_coarse", "sens_hotspot_margin", "sens_hotspot_span")],
+        "subframes": str(cfg.get("bler_subframes") or ""),
+    }
+    raw = json.dumps(parts, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def checkpoint_path():
+    """断点元数据路径（函数形式便于自检临时改写到 temp 目录，不碰真实断点）。"""
+    return CHECKPOINT_PATH
+
+
+def checkpoint_items_path():
+    """断点明细（JSONL，一条组合一行）：逐条追加，写入量与组合数成正比。
+
+    早期设计把 items 全塞进 meta 每次整写，单条含灵敏度全表 + 原始返回（数 KB~数十 KB），
+    1600 组合就是 O(n²) 的重复写盘（可达几十 GB），会显著拖慢测量；改成追加写后
+    每个组合只落自己那一行，meta 只存小字段。
+    """
+    return checkpoint_path() + ".items.jsonl"
+
+
+def read_checkpoint():
+    """读断点；不存在 / 损坏 / 版本不符 / 无有效进度一律返回 None。
+
+    绝不能因为一个坏文件拦住工具启动：所有异常都吞掉当作"没有断点"。
+    """
+    try:
+        path = checkpoint_path()
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            return None
+        if int(st.get("version") or 0) != CHECKPOINT_VERSION:
+            return None
+        if not st.get("combos"):
+            return None
+        st["total"] = int(st.get("total") or len(st["combos"]))
+        st["done"] = int(st.get("done") or 0)
+        # done=0（一个都没测完）与 done>total（文件被手改）都没有续测价值
+        if st["done"] <= 0 or st["done"] > st["total"]:
+            return None
+        # 明细逐行读够 done 条即可：
+        # · 行数 > done（meta 落后：上次写完明细还没写 meta 就被杀）→ 截断，多出的重测
+        # · 行数 < done（明细被删/截断）→ 以实际条数为准，宁可重测也不丢组合
+        items = []
+        ipath = checkpoint_items_path()
+        if os.path.isfile(ipath):
+            with open(ipath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    items.append(json.loads(line))
+                    if len(items) >= st["done"]:
+                        break
+        if len(items) < st["done"]:
+            st["done"] = len(items)
+            if st["done"] <= 0:
+                return None
+        st["items"] = items
+        return st
+    except Exception:
+        return None
+
+
+def write_checkpoint_meta(st):
+    """原子写 meta：先落 .tmp 再 os.replace —— 断电/杀进程也不会留下半截 JSON。
+
+    meta 落后于明细是安全的（读的时候按 done 截断，最多重测 1 个组合）；
+    meta 超出明细则会被修正为实际条数。两条都只会"多花一点时间"，绝不丢结果。
+    """
+    try:
+        path = checkpoint_path()
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def append_checkpoint_items(items, reset=False):
+    """把新完成的组合追加到明细文件（reset=True 时重建），并 fsync 落盘。"""
+    try:
+        ipath = checkpoint_items_path()
+        d = os.path.dirname(ipath)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(ipath, "w" if reset else "a", encoding="utf-8") as f:
+            for it in items:
+                f.write(json.dumps(it, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())   # 掉电也不丢已测组合（否则缓存里的数据会蒸发）
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def clear_checkpoint():
+    """删除断点（测试完整跑完 / 用户选择从头测 / 配置已变更时调用）。"""
+    for p in (checkpoint_path(), checkpoint_path() + ".tmp",
+              checkpoint_items_path()):
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except Exception:
+            pass
+
 
 
 # ----------------------------------------------------------------------------
@@ -1150,15 +2428,27 @@ def build_fdc_commands(cfg):
         return []
     segs.sort(key=lambda s: s[0])  # 确保频率递增
     table = "losstable"
-    rf_port = cfg.get("rf", "RF1C")
     cmds = []
     cmds.append("CONF:BASE:FDC:RCL")  # 先 DeACtivate 所有 FDC
     cmds.append("CONF:BASE:FDC:CTABle:DELete '%s'" % table)  # 删旧表（有则删）
-    cmds.append("CONF:BASE:FDC:CTABle:CREATE '%s', %.0f, %.1f" % (table, segs[0][0], segs[0][1]))
+    cmds.append("CONF:BASE:FDC:CTABle:CREATE '%s', %.0f, %s"
+                % (table, segs[0][0], _fmt_db(segs[0][1])))
     for freq_hz, loss_db in segs[1:]:
-        cmds.append("CONF:BASE:FDC:CTABle:ADD '%s', %.0f, %.1f" % (table, freq_hz, loss_db))
-    cmds.append("CONFigure:FDCorrection:ACTivate %s, '%s', TX" % (rf_port, table))
-    cmds.append("CONFigure:FDCorrection:ACTivate %s, '%s', RX" % (rf_port, table))
+        cmds.append("CONF:BASE:FDC:CTABle:ADD '%s', %.0f, %s"
+                    % (table, freq_hz, _fmt_db(loss_db)))
+    # 校准口严格按路由表：TX=下行口（PRX:RF1C / DRX:RF2C / MIMO:RF1C+RF2C），
+    # RX=上行口 RF1C（三种模式的上行都走 RF1COM/RFRX1）。
+    mode = norm_rx_path(cfg.get("rx_path"))
+    if _has_ports_cfg(cfg):
+        p = rx_ports_cfg(cfg)[mode]
+        tx_ports = [c for c, _v in p["tx"]]
+        rx_port = p["rx"][0]
+    else:
+        tx_ports = list(RX_PATH_TX_PORTS[mode])
+        rx_port = RX_PATH_RX_PORT
+    for _tx in tx_ports:
+        cmds.append("CONFigure:FDCorrection:ACTivate %s, '%s', TX" % (_tx, table))
+    cmds.append("CONFigure:FDCorrection:ACTivate %s, '%s', RX" % (rx_port, table))
     return cmds
 
 
@@ -1200,6 +2490,138 @@ def lookup_loss_mhz(cfg, mhz):
                 return (l0 + l1) / 2.0
             return l0 + (l1 - l0) * (f - f0) / (f1 - f0)
     return None
+
+
+# ----------------------------------------------------------------------------
+# FDC 线缆损耗表推荐值：断点取自 specs/LTE/bands.json 里各频段的实际上下行频率
+# ----------------------------------------------------------------------------
+# 损耗模型（不是实测值，是"普通测试台架"的起始参考，只保留 1 位小数）：
+#   现场经验：几百 MHz 以下 0.3 dB，1.x~2.2 GHz 约 0.5 dB（含 B1 的 2.1 GHz），
+#   2.3 GHz 以上（B40/B41）0.7 dB，3.5 GHz 约 1.0 dB，5 GHz 段（B46/n96）约 1.5 dB。
+#   锚点之间由 CMW 线性插值；2 GHz 实测 X dB 时整表按 X / 0.5 等比缩放（--loss-table X）。
+LOSS_ANCHORS_MHZ = (
+    (410.0, 0.3),    # 最低支持频段（B87/B88 的 410 MHz）
+    (1000.0, 0.3),   # ≤1 GHz 平台
+    (1500.0, 0.5),   # 1.x GHz
+    (2200.0, 0.5),   # 2.0~2.2 GHz 仍按 0.5（含 B1 的 2110~2170）
+    (2300.0, 0.7),   # 2.3 GHz 起（B40）
+    (2700.0, 0.7),   # B41 上边缘
+    (3500.0, 1.0),   # 3.5 GHz（B42/B43/n78）
+    (3800.0, 1.0),
+    (5150.0, 1.5),   # 5 GHz（B46/n96）
+    (5925.0, 1.5),
+)
+LOSS_MODEL_REF_DB = 0.5       # 2 GHz 参考损耗（--loss-table 的标定基准）
+LOSS_MODEL_REF_MHZ = 2000.0   # 参考频率
+
+
+def _fmt_db(value):
+    """损耗值格式化：固定 1 位小数（0.3 / 0.5 / 0.7 / 1.0）。
+
+    损耗按粗粒度锚点给值（几百 MHz 0.3、1.x GHz 0.5、2.x GHz 0.7、更高约 1），
+    1 位小数足够且配置串最易读；更细的小数只会让人误以为是实测值。
+    """
+    try:
+        return "%.1f" % float(value)
+    except (TypeError, ValueError):
+        return "0.0"
+
+
+def _anchor_loss_mhz(mhz):
+    """按 LOSS_ANCHORS_MHZ 锚点表线性插值（未缩放，MHz → dB）。"""
+    f = float(mhz)
+    anchors = LOSS_ANCHORS_MHZ
+    if f <= anchors[0][0]:
+        return anchors[0][1]
+    if f >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (f0, l0), (f1, l1) in zip(anchors, anchors[1:]):
+        if f0 <= f <= f1:
+            if f1 == f0:
+                return l1
+            return l0 + (l1 - l0) * (f - f0) / (f1 - f0)
+    return anchors[-1][1]
+
+
+def cable_loss_db(mhz, ref_db=LOSS_MODEL_REF_DB, ref_mhz=LOSS_MODEL_REF_MHZ):
+    """按粗粒度锚点表估算电缆+接头损耗（dB，1 位小数）。
+
+    ref_db 为 ref_mhz（默认 2 GHz）处的标定值，整表按 ref_db / 锚点值 等比缩放，
+    因此实测 2 GHz 损耗后只需重算一次即可整体平移。
+    """
+    try:
+        top = float(ref_db)
+    except (TypeError, ValueError):
+        top = float(LOSS_MODEL_REF_DB)
+    raw = _anchor_loss_mhz(mhz)
+    base = _anchor_loss_mhz(ref_mhz)
+    if base <= 0:
+        return round(raw, 1)
+    try:
+        return round(raw * top / base, 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return round(raw, 1)
+
+
+def supported_freq_ranges():
+    """支持频段的上下行频率区间（MHz），升序；数据来自 specs/LTE/bands.json。"""
+    ranges = []
+    for rec in _bands_json().values():
+        if not isinstance(rec, dict) or rec.get("reserved"):
+            continue
+        for lo_k, hi_k in (("f_dl_low", "f_dl_high"), ("f_ul_low", "f_ul_high")):
+            lo, hi = rec.get(lo_k), rec.get(hi_k)
+            if lo is None or hi is None:
+                continue
+            try:
+                ranges.append((float(lo), float(hi)))
+            except (TypeError, ValueError):
+                continue
+    ranges.sort()
+    return ranges
+
+
+def recommended_loss_points():
+    """FDC 断点频率（MHz，整数，严格递增）= 锚点表频率。
+
+    只保留"几百 MHz / 1.x GHz / 2.x GHz / 3.5 GHz / 5 GHz"几个台阶，
+    不再按频段边缘密插断点：损耗本身是经验值，断点越密反而越像"实测"。
+    """
+    out = []
+    for f, _loss in LOSS_ANCHORS_MHZ:
+        fi = int(round(f))
+        if not out or fi > out[-1]:
+            out.append(fi)
+    return out
+
+
+def recommend_loss_segments(ref_db=LOSS_MODEL_REF_DB):
+    """按锚点生成 freq_loss_segments 推荐串："freq_MHz:loss_dB, ..."（1 位小数）。"""
+    pts = recommended_loss_points()
+    return ", ".join("%d:%s" % (f, _fmt_db(cable_loss_db(f, ref_db=ref_db)))
+                     for f in pts)
+
+
+def recommend_loss_report(ref_db=LOSS_MODEL_REF_DB):
+    """生成推荐损耗表的可读报告（CLI --loss-table 使用）。"""
+    ranges = supported_freq_ranges()
+    pts = recommended_loss_points()
+    segs = recommend_loss_segments(ref_db)
+    lines = []
+    if not ranges:
+        return "未读到 specs/LTE/bands.json，无法生成推荐损耗表"
+    lo, hi = ranges[0][0], ranges[-1][1]
+    lines.append("支持频段频率覆盖：%.1f ~ %.1f MHz（按 bands.json 的 UL/DL 区间）"
+                 % (lo, hi))
+    lines.append("断点数：%d（粗粒度台阶，损耗只保留 1 位小数）" % len(pts))
+    lines.append("")
+    lines.append("freq_loss_segments = \"%s\"" % segs)
+    lines.append("")
+    lines.append("参考值：≤1 GHz 0.3 dB / 1.x~2.2 GHz 0.5 dB（含 B1）/ "
+                 "2.3 GHz 以上 0.7 dB / 3.5 GHz 1.0 dB / 5 GHz 段 1.5 dB")
+    lines.append("标定方法：实测 2 GHz 损耗 X dB → --loss-table X 重算整表"
+                 "（按 X / %.1f 等比缩放，仍保留 1 位小数）" % LOSS_MODEL_REF_DB)
+    return "\n".join(lines)
 
 
 def earfcn_to_dl_center_mhz(band, earfcn):
@@ -1249,8 +2671,13 @@ def build_signaling_init(cfg, band="", bw=""):
     c.append("*RST")
     c.append("*CLS")
 
-    # 路由（手册 p.1729）：SCEL <out>,<rx>,<in>,<tx>
-    c.append("ROUT:%s:SCEN:SCEL %s,%s,%s,TX1" % (p, cfg["rf"], cfg["rx"], cfg["rf"]))
+    # 路由（手册 p.1741~1743）：按接收路径模式选 SCEL 单路或 MIMO22 双路
+    c.extend(build_rx_route_commands(cfg))
+
+    # 传输模式：PRX+DRX(MIMO2x2) 灵敏度测的是主集+分集合并接收，按 3GPP
+    # TS 36.521-1 第7章 REFSENS 口径用 TM1（而非 MIMO 默认的空间复用 TM3）。
+    # 必须在路由激活场景之后下发（Command Reference 要求与场景兼容）。
+    c.extend(build_transmission_mode_commands(cfg))
 
     # FDC 频率响应校准（ASRrun V2.0.7 对比）——插在路由之后、频段配置之前
     c.extend(build_fdc_commands(cfg))
@@ -1273,7 +2700,7 @@ def build_signaling_init(cfg, band="", bw=""):
     c.append("CONF:%s:RFS:ENPMode ULPC" % p)
     c.append("CONF:%s:RFS:ENPower %.1f" % (p, f("enp")))
     c.append("CONF:%s:RFS:UMARgin %.1f" % (p, f("umar")))
-    c.append("CONF:%s:RFS:EATT:OUTP %.1f" % (p, f("eatt")))
+    c.extend(build_eatt_output_commands(cfg, f("eatt")))
     # 外接衰减器双向共用（FDD 双工同缆），UL 输入期望功率同步补偿（手册 p.1729 成对示例）
     c.append("CONF:%s:RFS:EATT:INP %.1f" % (p, f("eatt")))
 
@@ -1295,11 +2722,10 @@ def build_signaling_init(cfg, band="", bw=""):
     if bw:
         _init_rb = "N%d" % (6 if bw == "B014"
                             else int(BW_TO_MHZ.get(bw, 10) * 5))
-    c.append("CONF:%s:CONN:RMC:DL %s,%s,KEEP" % (p, _init_rb, cfg["dl_mod"]))
+    c.extend(build_dl_rmc_commands(cfg, _init_rb, cfg["dl_mod"]))
     c.append("CONF:%s:CONN:RMC:UL %s,QPSK,KEEP" % (p, _init_rb))
     # 参考工具 ASRrun 显式固定 RB 起始位置为 LOW；不写时依赖仪表默认，
-    # 跨带宽/STYP 切换后可能出现位置残留，故初始化即固定。
-    c.append("CONF:%s:CONN:RMC:RBP:DL LOW" % p)
+    # 跨带宽/STYP 切换后可能出现位置残留，故初始化即固定（DL 侧已含在 build_dl_rmc_commands）。
     c.append("CONF:%s:CONN:RMC:RBP:UL LOW" % p)
 
     # Multi Evaluation 走 Combined Signal Path，master = 信令应用
@@ -1448,7 +2874,7 @@ def set_sens_power(scpi, cfg, mode, log=None):
         time.sleep(settle)
 
 
-def build_udch_commands(band, bw):
+def build_udch_commands(band, bw, cfg=None):
     """构造灵敏度 REFSENS 参考信道的 UDCH 配置命令（手册 p.1766~1767）。
 
     UL: UDCHannels:UL <NumberRB>,<StartRB>,QPSK,KEEP —— 精确 LCRB@RBstart；
@@ -1463,9 +2889,13 @@ def build_udch_commands(band, bw):
     # 数据缺失回退到该带宽满 RB@0（满 RB 数本身是仪表合法枚举，窄带也不会越界）
     rb = ul_rb_for(band, bw) or (dl_rb, 0)
     lcrb, start = rb
+    # MIMO 双流：DL UDCH 需 DL1/DL2 各配一条（手册 p.1766）；单路保持原 DL 写法。
+    _cfg = cfg or {}
+    dl_cmds = build_dl_udch_command(_cfg, dl_rb)
     return {
         "set_udch": "CONF:%s:CONN:STYP UDCH" % p,
-        "dl": "CONF:%s:CONN:UDCH:DL %d,0,QPSK,KEEP" % (p, dl_rb),
+        "dl": dl_cmds[0],
+        "dl_extra": dl_cmds[1:],
         "ul": "CONF:%s:CONN:UDCH:UL %d,%d,QPSK,KEEP" % (p, lcrb, start),
         "rb": rb, "dl_rb": dl_rb,
         "source": ul_cfg_source(),
@@ -1483,16 +2913,18 @@ def restore_rmc_commands(cfg, bw=""):
     if bw:
         rb = "N%d" % (6 if bw == "B014"
                       else int(BW_TO_MHZ.get(bw, 10) * 5))
-    return [
+    out = [
         "CONF:%s:CONN:STYP RMC" % p,
-        "CONF:%s:CONN:RMC:DL %s,%s,KEEP" % (p, rb, cfg["dl_mod"]),
+    ]
+    out.extend(build_dl_rmc_commands(cfg, rb, cfg["dl_mod"]))
+    out.extend([
         "CONF:%s:CONN:RMC:UL %s,QPSK,KEEP" % (p, rb),
-        "CONF:%s:CONN:RMC:RBP:DL LOW" % p,
         "CONF:%s:CONN:RMC:RBP:UL LOW" % p,
         # 灵敏度段打开的 OCNG 必须关闭：残留 OCNG 噪声会抬高 UE 上行功率，
         # 导致后续 TX 测量 CMW 前端 Overdriven（Reliability=3）中止。
         "CONF:%s:DL:OCNG OFF" % p,
-    ]
+    ])
+    return out
 
 
 def apply_sens_rb(scpi, band, bw, cfg, log=None, recheck=None):
@@ -1518,7 +2950,7 @@ def apply_sens_rb(scpi, band, bw, cfg, log=None, recheck=None):
 
     切 STYP/RBP/RMC:UL 会使 UE 掉线重连，故下发后按 recheck 回调主动重新附着。
     """
-    cmds = build_udch_commands(band, bw)
+    cmds = build_udch_commands(band, bw, cfg)
     def w(cmd):
         scpi.write(cmd)
         if log:
@@ -1538,6 +2970,8 @@ def apply_sens_rb(scpi, band, bw, cfg, log=None, recheck=None):
         w("CONF:%s:CONN:UET RMC" % p)
         w(cmds["set_udch"])
         w(cmds["dl"])
+        for _dl in cmds.get("dl_extra") or []:
+            w(_dl)
         w(cmds["ul"])
     else:
         # RBstart=0：RMC 即可精确表达，与 ASRrun 参考流程完全一致
@@ -1550,9 +2984,9 @@ def apply_sens_rb(scpi, band, bw, cfg, log=None, recheck=None):
                 (band_label(band), bw_label(bw), lcrb, cmds["dl_rb"], cmds["source"]))
         w("CONF:%s:CONN:UET RMC" % p)
         w("CONF:%s:CONN:STYP RMC" % p)
-        w("CONF:%s:CONN:RMC:DL N%d,%s,KEEP" % (p, cmds["dl_rb"], cfg["dl_mod"]))
+        for _dl in build_dl_rmc_commands(cfg, "N%d" % cmds["dl_rb"], cfg["dl_mod"]):
+            w(_dl)
         w("CONF:%s:CONN:RMC:UL N%d,QPSK,KEEP" % (p, lcrb))
-        w("CONF:%s:CONN:RMC:RBP:DL LOW" % p)
         w("CONF:%s:CONN:RMC:RBP:UL LOW" % p)
     cmds["mode"] = mode
     if recheck:
@@ -1845,6 +3279,30 @@ RE_VALUE = r"^[-+0-9]"
 # AT 自动恢复（掉线重注册加速）：与 GUI 手动 AT 发送共用同一把串口锁
 _AT_SER_LOCK = threading.Lock()
 AT_PORT_BAUD = 115200
+
+
+def pick_at_port(ports):
+    """按端口描述挑默认 AT 口：modem device 优先，排除 modem device2 等次级口。
+
+    ports: [(device, description), ...]；返回 device 名，无端口返回 ""。
+    判定顺序：含 "modem device" 且非 device2 → 含 modem/asr 等关键词 → 其余；
+    同级按 COM 名排序，保证每次检测结果稳定。
+    """
+    if not ports:
+        return ""
+
+    def rank(item):
+        dev, desc = item
+        d = str(desc or "").lower()
+        # "modem device2" / "modem device 2" / "modem device (2)" 视为次级口
+        secondary = bool(re.search(r"device\s*[\(\[]?\s*[2-9]", d))
+        if "modem device" in d and not secondary:
+            return (0, dev)
+        if any(k in d for k in ("modem", "asr", "at ", "at-")):
+            return (1, dev)
+        return (2, dev)
+
+    return sorted(ports, key=rank)[0][0]
 
 
 def _at_recovery_port(cfg):
@@ -2142,7 +3600,10 @@ def reconnect_after_styp(scpi, log=None, timeout=20.0, cfg=None, recovery_level=
 
 def _apply_cell_params(scpi, cfg, band, bw, earfcn, w, log=None, skip_band=False,
                        order=None, park_earfcn=None):
-    """下发频段/带宽/信道 + 按新带宽重配 RMC RB + 动态 EATT（快切/重建共用）。
+    """下发频段/带宽/信道 + 按新带宽重配 RMC RB + 损耗补偿（快切/重建共用）。
+
+    损耗补偿：只走 FDC 表（按频点插值，覆盖全部信道）。EATT 保持 config.eatt 的
+    固定值、不随信道改写——两条路径同时用会叠加成 2× 补偿。
 
     关键（真机 2026-11-23 19:20）：带宽切换后 RMC 必须按新带宽重配 DL/UL RB，
     否则小区是 15MHz(B150) 而 RMC 还是 N50(10MHz)，UE attach 时 DL SCH RB 与
@@ -2183,23 +3644,22 @@ def _apply_cell_params(scpi, cfg, band, bw, earfcn, w, log=None, skip_band=False
             if bw == "B014":
                 _rb = 6
             _dl_mod = (cfg.get("dl_mod") or "QPSK")
-            w("CONF:%s:CONN:RMC:DL N%d,%s,KEEP" % (p, _rb, _dl_mod))
+            for _cmd in build_dl_rmc_commands(cfg, "N%d" % _rb, _dl_mod):
+                w(_cmd)
             w("CONF:%s:CONN:RMC:UL N%d,QPSK,KEEP" % (p, _rb))
-            w("CONF:%s:CONN:RMC:RBP:DL LOW" % p)
             w("CONF:%s:CONN:RMC:RBP:UL LOW" % p)
 
     def _eatt():
+        # 损耗补偿统一由 FDC 表完成（频率相关、按频点插值、覆盖全部信道）。
+        # EATT 只保留 config.eatt 的固定值（初始化时已下发），不再按信道改写，
+        # 否则与 FDC 叠加成 2× 补偿（真机日志 20261126_142425 实测两处都在生效）。
+        if not log:
+            return
         _mhz = earfcn_to_dl_center_mhz(band, earfcn)
         _loss = lookup_loss_mhz(cfg, _mhz) if _mhz else None
-        if _loss is not None and _loss > 0:
-            w("CONF:%s:RFS:EATT:OUTP %.1f" % (p, _loss))
-            w("CONF:%s:RFS:EATT:INP %.1f" % (p, _loss))
-            if log:
-                log("[EATT] DL=%.1f MHz → 外部线缆损耗 %.1f dB（OUTP/INP 均补偿）"
-                    % (_mhz, _loss))
-        elif _loss == 0.0:
-            w("CONF:%s:RFS:EATT:OUTP 0.0" % p)
-            w("CONF:%s:RFS:EATT:INP 0.0" % p)
+        if _loss:
+            log("[FDC] DL=%.1f MHz → 损耗 %s dB（由 FDC 表补偿，EATT 不再叠加）"
+                % (_mhz, _fmt_db(_loss)))
 
     _steps = {"band": _band, "bw": _bw, "chan": _chan, "park": _park,
               "rmc": _rmc, "eatt": _eatt}
@@ -2450,7 +3910,7 @@ def retune_cell(scpi, cfg, band, bw, earfcn, log=None):
         for cmd in fdd_cell_commands():
             w(cmd)
 
-    # ②b 重配频段 / 带宽 / 信道 + 按新带宽重配 RMC RB + 动态 EATT
+    # ②b 重配频段 / 带宽 / 信道 + 按新带宽重配 RMC RB（损耗由 FDC 表补偿）
     # （与 try_fast_retune 共用，避免两处带宽 RB 换算逻辑漂移）
     _apply_cell_params(scpi, cfg, band, bw, earfcn, w, log)
 
@@ -2685,7 +4145,7 @@ def sens_min_total_for(cfg, power_mode="high"):
 
 
 def measure_sensitivity(scpi, cfg, enabled=None, log=None, band="", bw="", hotspot=None,
-                        theory_seed=None, power_mode="high"):
+                        theory_seed=None, power_mode="high", force_warmup=False):
     """灵敏度探底：自适应步进扫描，找满足 Throughput ≥ 门限的最低下行电平。
 
     判定量 = FETC:LTE:SIGN:EBLer:REL? 的第 2 值 Total Throughput(%)（idx 1，
@@ -2713,6 +4173,14 @@ def measure_sensitivity(scpi, cfg, enabled=None, log=None, band="", bw="", hotsp
     if "sensitivity" not in enabled:
         return None
     cmds = build_bler_commands(cfg, float(cfg["sens_start"]))
+    # BLER 轮询间隔：CMW 的 STAT? 查询很轻（一次往返 <10ms），0.3s 一轮会让每个
+    # 测量点平均多等 0.15s；实测 15 点/组合可省 ~1.5s。config 的 sens_poll 可调
+    # （0.05~1.0），真机若有查询拥塞可调回 0.3。
+    try:
+        poll_gap = float(cfg.get("sens_poll", 0.15) or 0.15)
+    except (TypeError, ValueError):
+        poll_gap = 0.15
+    poll_gap = max(0.05, min(poll_gap, 1.0))
     def w(cmd):
         scpi.write(cmd)
         if log:
@@ -2747,26 +4215,49 @@ def measure_sensitivity(scpi, cfg, enabled=None, log=None, band="", bw="", hotsp
     # → RDY → FETCh 丢弃），让 CMW + UE 在当前功率档下先完成一次完整测量，
     # 第二次 INIT 就能拿到 TotalBlocks=100 的准确统计。
     # 大功率档一般不需要 warmup，但加一次也无害。
-    # 时长优化（2026-11-25）：热点续扫（同频段同带宽上一信道刚测完）+ 大功率档
-    # 时 UE/CMW 已在同一配置下稳定测量过，warmup 纯属重复，跳过省 ~2s/信道；
-    # 低功率档（上行功率档已切换）仍保留。
-    _need_warmup = not (hot is not None and power_mode == "high")
+    # 时长优化：同档热点续扫 = 本功率档刚在该频段上测过一个信道，UE/CMW 已在
+    # 同一功率档下稳定测量过，warmup 纯属重复。
+    # 2026-11-27 修正：原来只对 high 档跳过（power_mode == "high"），Pmin 档每个
+    # 信道都白做一次预同步（一次 600 子帧 INIT，约 0.7s）。
+    # 现改为「有同档热点就跳过」，Pmin 是否跟随由 sens_skip_warmup_low 控制
+    # （默认 1=跳过；现场若发现 Pmin 首点统计不稳，改 0 即恢复旧行为）。
+    # 切到新功率档后的首次测量（无同档热点）无论如何都要 warmup：小功率档首测
+    # TotalBlocks 只有 80 多、BLER 虚高会让整轮判 FAIL。
+    _skip_low = str(cfg.get("sens_skip_warmup_low", "1")).strip().lower() not in (
+        "0", "false", "no", "")
+    if force_warmup or hot is None:
+        _need_warmup = True
+    elif power_mode == "high":
+        _need_warmup = False
+    else:
+        _need_warmup = not _skip_low
     _warmup_level = float(cfg["sens_start"])  # -85dBm 强信号
     _warmup_resp = ""
     if _need_warmup:
         w("CONF:LTE:SIGN:DL:RSEPre:LEVel %.1f" % _warmup_level)
         w(cmds["init"])
-        _t0 = time.time()
-        while time.time() - _t0 < float(cfg.get("bler_timeout", 10)) + 2:
-            _st = scpi.query(cmds["state_q"], timeout=2, expect=RE_STAT)
-            if "RDY" in _st.upper():
-                break
-            time.sleep(0.3)
-        _warmup_resp = scpi.query(cmds["fetch"], timeout=3, expect=RE_VALUE)
+        # 2026-11-27 真机事故（LTE_20261126_195411，跑 13.4 小时后在组合
+        # 1629/7096 处）：这里原来用裸 query(timeout=2) 轮询，仪表瞬时未应答
+        # 就抛 socket.timeout 穿透到 _measure_worker，整轮作废。预同步只是"热身"，
+        # 失败不该终止整轮，故改用 wait_for（内部吞异常按 poll_gap 重试）并全程兜底。
+        _warm_ok, _warm_st = wait_for(scpi, cmds["state_q"],
+                                      lambda s: "RDY" in s.upper(),
+                                      float(cfg.get("bler_timeout", 10)) + 2,
+                                      poll_gap, log, query_timeout=2,
+                                      expect=RE_STAT)
+        _warmup_resp = ""
+        try:
+            _warmup_resp = scpi.query(cmds["fetch"], timeout=5, expect=RE_VALUE)
+        except Exception as exc:
+            if log:
+                log("[EBLer warmup] 取预同步结果失败：%s — 继续测量（扫描自带重测兜底）"
+                    % exc)
         if log:
-            log("[EBLer warmup] 小功率档预同步 1 次（丢弃），FETC=%s" % _warmup_resp[:60])
+            log("[EBLer warmup] 小功率档预同步 1 次（丢弃）%s，FETC=%s"
+                % ("" if _warm_ok else "[STAT 未就绪，继续]", _warmup_resp[:60]))
     elif log:
-        log("[EBLer warmup] 热点续扫+大功率档：UE 已稳定，跳过预同步（省 ~2s）")
+        log("[EBLer warmup] %s 档热点续扫：UE 已在该功率档稳定，跳过预同步（省 ~0.7s）"
+            % SENS_POWER_LABELS.get(power_mode, power_mode))
 
     def fnum(key, default):
         try:
@@ -2869,7 +4360,7 @@ def measure_sensitivity(scpi, cfg, enabled=None, log=None, band="", bw="", hotsp
         w("INIT:LTE:SIGN:EBLer")
         ok, st = wait_for(scpi, cmds["state_q"],
                           lambda s: "RDY" in s.upper(),
-                          float(cfg["bler_timeout"]) + 3.0, 0.3, log,
+                          float(cfg["bler_timeout"]) + 3.0, poll_gap, log,
                           expect=RE_STAT)
         resp = scpi.query(cmds["fetch"], expect=RE_VALUE)
         if log:
@@ -2891,7 +4382,7 @@ def measure_sensitivity(scpi, cfg, enabled=None, log=None, band="", bw="", hotsp
             w("INIT:LTE:SIGN:EBLer")
             ok, st = wait_for(scpi, cmds["state_q"],
                               lambda s: "RDY" in s.upper(),
-                              float(cfg["bler_timeout"]) + 3.0, 0.3, log,
+                              float(cfg["bler_timeout"]) + 3.0, poll_gap, log,
                               expect=RE_STAT)
             resp = scpi.query(cmds["fetch"], expect=RE_VALUE)
             if log:
@@ -3528,10 +5019,122 @@ def _fmt_elapsed(secs):
     return "%dm%02ds" % (m, rem2) if rem2 else "%dm" % m
 
 
-def export_results(result, path_xlsx, path_txt):
+_NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+
+
+def xlsx_cell_value(v):
+    """导出 xlsx 用：把「看着是数字」的字符串转成真正的数字单元格。
+
+    Excel 对「文本型数字」会在左上角画绿色三角（还会让排序/求和失效），
+    根本原因是单元格类型是文本。表格里的 -96.3 / 0.4 / 12.5 都是测量值，
+    写成数字才正常；50@0、CH50、B1、10MHz、— 这类非纯数字仍保持文本。
+    空串写成真正的空单元格，避免留下带格式的空字符串。
+    """
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    if not _NUM_RE.fullmatch(s):
+        return s
+    try:
+        if "." not in s:
+            return int(s)
+        return float(s)
+    except ValueError:
+        return s
+
+
+def xlsx_number_format(v):
+    """沿用原字符串的小数位（-96.30 仍显示 -96.30，-96.3 仍显示 -96.3）。"""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    m = re.fullmatch(r"[+-]?\d+\.(\d+)", s)
+    if not m:
+        return None
+    return "0." + "0" * len(m.group(1))
+
+
+# 「灵敏度探底」页「原始返回」列的宽度上限：内容多长就开多宽，超过这个值才换行。
+# 不设上限时一条几百字符的 SCPI 应答会把整张表撑到没法看；设太小（原 60）则
+# 内容被截断，需要点单元格才能看到全貌。
+RAW_COL_MAX_W = 120
+
+
+def xlsx_text_width(v):
+    """按显示宽度估算（CJK/全角算 2 个字符宽），多行取最长一行。"""
+    best = 0
+    for line in str(v).split("\n"):
+        w = 0
+        for ch in line:
+            w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w > best:
+            best = w
+    return best
+
+
+def xlsx_polish(ws, center=True, min_width=6, max_width=40):
+    """统一版式：内容居中 + 按内容自适应列宽 + 表头固定两行高。
+
+    列宽按显示宽度 + 2 留白估算并夹在 [min_width, max_width]，但**表头列必须
+    放得下最长一行的整行文字**：宽度不够时 Excel 会把「两行表头」再折成三行
+    （Sens@Pmax / (dBm) 这种），用户看到的就是「首行信息变成 3 行」。
+    实测 Calibri 11 粗体每字符约需 1.3 个列宽单位。
+    """
+    from openpyxl.styles import Alignment
+    from openpyxl.utils import get_column_letter
+    widths = {}
+    for row in ws.iter_rows():
+        for c in row:
+            if c.value is None:
+                continue
+            w = xlsx_text_width(c.value)
+            if w > widths.get(c.column, 0):
+                widths[c.column] = w
+    hdr_need = {}
+    for c in (ws[1] if ws.max_row >= 1 else []):
+        if c.value is None:
+            continue
+        longest = max([xlsx_text_width(x) for x in str(c.value).split("\n")] or [0])
+        hdr_need[c.column] = int(math.ceil(longest * 1.3)) + 2
+    for col, w in widths.items():
+        need = max(w + 2, hdr_need.get(col, 0))
+        ws.column_dimensions[get_column_letter(col)].width = \
+            max(min_width, min(max_width, need))
+    # center=False 用于「项目 / 值」这类键值对表。这里必须显式设左对齐：
+    # 不设 alignment 时 Excel 按默认 general 处理——文本靠左、数字靠右，
+    # 同一列的值会参差不齐（psu_voltage 3.800 靠右、band 列表靠左）。
+    align = Alignment(horizontal="center" if center else "left",
+                      vertical="center")
+    lines = 1
+    for c in (ws[1] if ws.max_row >= 1 else []):
+        if isinstance(c.value, str):
+            lines = max(lines, c.value.count("\n") + 1)
+            if "\n" in c.value:
+                # 表头带换行（"Power@Pmax\n(dBm)"）必须开自动换行，否则只显示半截
+                c.alignment = Alignment(horizontal="center", vertical="center",
+                                        wrap_text=True)
+                continue
+        if align is not None:
+            c.alignment = align
+    if align is not None:
+        for row in ws.iter_rows(min_row=2):
+            for c in row:
+                c.alignment = align
+    if lines > 1:
+        ws.row_dimensions[1].height = 15 * lines + 2
+
+
+def export_results(result, path_xlsx, path_txt, detail=True):
     """把完整测量结果导出为 xlsx 与 txt。返回 (ok, err)。
 
     result = {"time", "cfg", "items":[{"combo","data","rows"}], "limits"}
+    detail=False 时跳过「灵敏度探底明细」页与其文本段——测试过程中的同步快照
+    用它：明细页行数 = 组合数 × 扫描点数（7096 组合可达 10 万行），每次全量
+    重写要好几秒，不适合每隔几十秒落一次盘。
     """
     items = result.get("items") or []
     cfg = result.get("cfg") or {}
@@ -3546,6 +5149,15 @@ def export_results(result, path_xlsx, path_txt):
         lines = []
         lines.append("CMW500 LTE 射频指标测试报告（信令模式）")
         lines.append("=" * 60)
+        if result.get("snapshot"):
+            # 过程中快照：必须写明还没跑完，否则会被当成最终报告
+            lines.append("【过程中快照·尚未跑完】已完成 %d/%d 个组合（%.1f%%），"
+                         "正式报告在整轮跑完后生成" %
+                         (int(result.get("progress") or len(items)),
+                          int(result.get("total") or len(items)),
+                          100.0 * (result.get("progress") or len(items)) /
+                          max(int(result.get("total") or len(items)), 1)))
+            lines.append("")
         _st = result.get("start_time") or result.get("time", "")
         _et = result.get("end_time") or result.get("time", "")
         _el = result.get("elapsed_str") or ""
@@ -3553,9 +5165,10 @@ def export_results(result, path_xlsx, path_txt):
         lines.append("结束时间: %s" % _et)
         if _el:
             lines.append("总耗时: %s（%.1f 秒）" % (_el, result.get("elapsed_sec", 0)))
-        lines.append("CMW500: %s:%s  RF口=%s  RX=%s" %
-                     (cfg.get("cmw_ip", ""), cfg.get("cmw_port", ""),
-                      cfg.get("rf", ""), cfg.get("rx", "")))
+        lines.append("CMW500: %s  %s" %
+                     (link_desc(link_addr(cfg, "cmw"), cfg.get("cmw_port")),
+                      rx_path_desc(cfg.get("rx_path"), cfg)))
+        lines.append("接收路径模式: %s" % rx_path_label(cfg.get("rx_path")))
         lines.append("频段 / 各自带宽: %s" %
                      band_bws_summary(cfg.get("bands") or [],
                                       cfg.get("band_bws") or {}))
@@ -3573,7 +5186,7 @@ def export_results(result, path_xlsx, path_txt):
             lines.append(" | ".join(str(x) for x in it.get("wide", [])))
         lines.append("")
         # 只有勾选灵敏度时才输出探底明细 section（纯 TX 测试此 section 完全无内容）
-        if _metrics and _metrics.get("sensitivity"):
+        if detail and _metrics and _metrics.get("sensitivity"):
             lines.append("【灵敏度探底明细】")
             lines.append("判定标准: Throughput >= %s%%（FETC:LTE:SIGN:EBLer:REL? 第2值 Total TPut）" %
                          cfg.get("sens_throughput", 95))
@@ -3605,6 +5218,10 @@ def export_results(result, path_xlsx, path_txt):
             f.write("\n".join(lines))
     except Exception as exc:
         return False, "TXT 写入失败: %s" % exc
+
+    if path_xlsx is None:
+        # 只要 txt（测试过程中的逐组合同步保存）：跳过整表重建
+        return True, ""
 
     # ---- XLSX（openpyxl，缺失时降级为 CSV）----
     try:
@@ -3671,25 +5288,50 @@ def export_results(result, path_xlsx, path_txt):
             combo_label = it.get("combo", "")
             for col_idx, header in enumerate(exp_headers, 1):
                 val = wide[col_idx - 1] if col_idx - 1 < len(wide) else ""
-                c = ws.cell(row=row_idx, column=col_idx, value=val)
+                # 数值写成数字单元格：文本型数字会带绿色三角且排序/求和失效
+                c = ws.cell(row=row_idx, column=col_idx, value=xlsx_cell_value(val))
+                nf = xlsx_number_format(val)
+                if nf:
+                    c.number_format = nf   # 沿用原小数位，-96.30 不会被压成 -96.3
                 fill = _cell_fill(col_idx, header, val, combo_label)
                 if fill is not None:
                     c.fill = fill
-        # 灵敏度明细页（大功率 / 小功率两套）
-        ws2 = wb.create_sheet("灵敏度探底")
-        ws2.append(["组合", "功率档", "RS EPRE(dBm/15kHz)", "Full Cell BW(dBm)",
-                    "Throughput(%)", "是否满足门限", "扫描阶段", "原始返回"])
-        for c in ws2[1]:
-            c.font = Font(bold=True)
-        for it in items:
-            d = it.get("data") or {}
-            for tag, sens in (("大功率", d.get("sensitivity")),
-                              ("小功率", d.get("sensitivity_low"))):
-                if sens:
-                    for rec in sens.get("table", []):
-                        ws2.append([it["combo"], tag, rec["level"], rec.get("level_bw"),
-                                    rec.get("throughput"), "PASS" if rec["pass"] else "FAIL",
-                                    rec.get("phase", ""), rec["raw"]])
+        # 版式：整表居中 + 按内容自适应列宽 + 两行表头自动加高
+        xlsx_polish(ws, center=True, max_width=30)
+        # 冻结「首行 + 左边 3 列」：左右滚动时 Band / BW / DL Channel 始终可见，
+        # 否则滑到中间只剩一堆数字，看不出这一行是哪个频段哪个信道
+        ws.freeze_panes = "D2"
+        if detail:
+            # 灵敏度明细页（大功率 / 小功率两套）
+            ws2 = wb.create_sheet("灵敏度探底")
+            ws2.append(["组合", "功率档", "RS EPRE(dBm/15kHz)", "Full Cell BW(dBm)",
+                        "Throughput(%)", "是否满足门限", "扫描阶段", "原始返回"])
+            for c in ws2[1]:
+                c.font = Font(bold=True)
+            for it in items:
+                d = it.get("data") or {}
+                for tag, sens in (("大功率", d.get("sensitivity")),
+                                  ("小功率", d.get("sensitivity_low"))):
+                    if sens:
+                        for rec in sens.get("table", []):
+                            ws2.append([xlsx_cell_value(x) for x in
+                                        (it["combo"], tag, rec["level"], rec.get("level_bw"),
+                                         rec.get("throughput"),
+                                         "PASS" if rec["pass"] else "FAIL",
+                                         rec.get("phase", ""), rec["raw"])])
+            # 原始返回列可能很长：整表列宽上限先夹到 60，再单独把这一列按实际内容
+            # 展开（上限 RAW_COL_MAX_W），长串自动换行，保证内容完整可见而不是被截断
+            xlsx_polish(ws2, center=True, max_width=60)
+            from openpyxl.styles import Alignment as _Al
+            from openpyxl.utils import get_column_letter as _cl
+            _raw_col = _cl(ws2.max_column)
+            _raw_vals = [str(_c.value) for _c in ws2[_raw_col][1:] if _c.value is not None]
+            _raw_w = max([xlsx_text_width(v) for v in _raw_vals] or [0])
+            ws2.column_dimensions[_raw_col].width = max(26, min(RAW_COL_MAX_W, _raw_w + 2))
+            for _c in ws2[_raw_col][1:]:
+                # 原始返回是自由文本，左对齐比居中好读；开自动换行保证长串不被截断
+                _c.alignment = _Al(horizontal="left", vertical="center", wrap_text=True)
+            ws2.freeze_panes = "A2"
         # 配置页
         ws3 = wb.create_sheet("测试配置")
         ws3.append(["项目", "值"])
@@ -3706,7 +5348,13 @@ def export_results(result, path_xlsx, path_txt):
                   "pmax", "freq", "psu_enable", "psu_channel",
                   "psu_voltage", "sens_start", "sens_stop", "sens_step",
                   "sens_near", "sens_coarse", "sens_throughput", "stats"):
-            ws3.append([k, cfg.get(k, "")])
+            # 配置值也走数值转换：'3.800' / '23' 这类以文本写进去同样会被
+            # Excel 画上「文本型数字」绿三角，每个 sheet 都要干净
+            _raw = cfg.get(k, "")
+            ws3.append([k, xlsx_cell_value(_raw)])
+            _nf = xlsx_number_format(_raw)
+            if _nf:
+                ws3.cell(row=ws3.max_row, column=2).number_format = _nf
         ws3.append(["bands", ",".join(band_label(b) for b in (cfg.get("bands") or []))])
         ws3.append(["bws", ",".join(bw_label(w) for w in (cfg.get("bws") or []))])
         _bb = cfg.get("band_bws") or {}
@@ -3714,6 +5362,9 @@ def export_results(result, path_xlsx, path_txt):
             ws3.append(["band %s" % band_label(_b),
                         ",".join(bw_label(_w) for _w in (_bb.get(_b) or []))])
         ws3.append(["channel_source", channel_table_source()])
+        # 配置页是「项目 / 值」两列：两列都靠左（center=False → 显式左对齐），
+        # 只做列宽自适应。不显式设的话数字值会靠右，"3.800" 与文字混排很乱。
+        xlsx_polish(ws3, center=False, max_width=72)
         wb.save(path_xlsx)
     except ImportError:
         # 降级：用 CSV 内容写入 .csv（同名），并提示
@@ -3779,6 +5430,119 @@ def run_selftest():
     # 解析
     assert parse_values("1,2.5,-3.1E+1,NCAP,0.5") == [1.0, 2.5, -31.0, None, 0.5]
     assert parse_scalar("NCAP,3.8") == 3.8
+    # 地址识别：IP/主机名 → Raw Socket；VISA 资源串 → VISA（GPIB/USB/TCPIP::INSTR）
+    assert not is_visa_address("192.168.1.100")
+    assert not is_visa_address("cmw500.local")
+    assert not is_visa_address("")
+    assert is_visa_address("GPIB0::20::INSTR")
+    assert is_visa_address("gpib0,20")
+    assert is_visa_address("USB0::2733::87::123456::INSTR")
+    assert is_visa_address("TCPIP0::10.0.0.5::inst0::INSTR")
+    assert is_visa_address("visa://pc1/GPIB0::20::INSTR")
+    # 简写归一：GPIB0,20 / GPIB0:20 / GPIB::20 / GPIB0::20 都要补成标准资源串
+    assert normalize_visa_address("GPIB0,20") == "GPIB0::20::INSTR"
+    assert normalize_visa_address("gpib0:20") == "GPIB0::20::INSTR"
+    assert normalize_visa_address("GPIB::20::INSTR") == "GPIB0::20::INSTR"
+    assert normalize_visa_address("GPIB0::20") == "GPIB0::20::INSTR"
+    assert normalize_visa_address("GPIB1::1::INSTR") == "GPIB1::1::INSTR"
+    assert normalize_visa_address("visa://pc1/GPIB0::20::INSTR") \
+        == "visa://pc1/GPIB0::20::INSTR"
+    assert normalize_visa_address("192.168.1.100") == "192.168.1.100"
+    # 中文输入法/粘贴污染：全角冒号、全角空格、零宽字符、GPIB-0 写法都要能救回来
+    assert clean_address("　GPIB0：：20：：INSTR ") == "GPIB0::20::INSTR"
+    assert clean_address("GPIB0\u200b::20") == "GPIB0::20"
+    assert clean_address("１０．３８．２６．１１２") == "10.38.26.112"   # 全角数字/句点
+    assert is_visa_address("GPIB0：：20：：INSTR")
+    assert normalize_visa_address("GPIB0：：20：：INSTR") == "GPIB0::20::INSTR"
+    assert normalize_visa_address("gpib-0::20") == "GPIB0::20::INSTR"
+    assert normalize_visa_address("GPIB 0 20") == "GPIB0::20::INSTR"
+    # 主机名不能被误判成 USB 资源（usb-server 之类）
+    assert not is_visa_address("usb-server")
+    assert not is_visa_address("gpib-lab-pc")
+    # 地址框里连端口一起填：以地址框为准；主机名里的空格直接去掉
+    assert split_host_port("10.38.26.112:5125", "5025") == ("10.38.26.112", "5125")
+    assert split_host_port("10.38.26. 112", "5025") == ("10.38.26.112", "5025")
+    assert split_host_port("GPIB0,20", "5025") == ("GPIB0,20", "5025")   # VISA 串不动
+    assert split_host_port("cmw500.local", "5025") == ("cmw500.local", "5025")
+    # 地址解析失败必须给可照做的中文提示，而不是裸 getaddrinfo failed
+    assert "GPIB0::20::INSTR" in _bad_address_hint("bad-host")
+    # 【接口】下拉（LAN/GPIB）与地址写法的一致性
+    assert link_mode_from_address("10.38.26.112") == "LAN"
+    assert link_mode_from_address("GPIB0,20") == "GPIB"
+    assert link_mode_from_address("20") == "GPIB"       # 只写地址号也算 GPIB
+    assert normalize_gpib_short("20") == "GPIB0::20::INSTR"
+    assert normalize_gpib_short("GPIB0,20") == "GPIB0::20::INSTR"
+    assert look_like_host("192.168.1.100") and look_like_host("cmw500.local")
+    assert not look_like_host("GPIB0::20")
+    assert "如 20" in link_tip("CMW500", "GPIB")          # GPIB：只填数字
+    assert "192.168.1.100" in link_tip("CMW500", "LAN")   # LAN：填 IP
+    assert "192.168.1.100" not in link_tip("CMW500", "GPIB")
+    # GPIB 地址只填数字 + 板号单独选：解析/组装/范围校验
+    assert parse_gpib_addr("20") == (None, "20")
+    assert parse_gpib_addr("GPIB1::20::INSTR") == (1, "20")
+    assert parse_gpib_addr("GPIB0,5") == (0, "5")
+    assert parse_gpib_addr("10.38.26.112") is None
+    assert build_gpib_resource(0, "20") == "GPIB0::20::INSTR"
+    assert build_gpib_resource("GPIB1", "5") == "GPIB1::5::INSTR"
+    assert gpib_board_of("GPIB1") == 1 and gpib_board_of("") == 0
+    assert gpib_board_label(1) == "GPIB1"
+    assert gpib_primary_ok("20") and gpib_primary_ok("0")
+    assert not gpib_primary_ok("31") and not gpib_primary_ok("2a")
+    assert gpib_primary_typing_ok("") and gpib_primary_typing_ok("20")
+    assert not gpib_primary_typing_ok("192") and not gpib_primary_typing_ok("2a")
+    # 配置里的地址拆除：完整资源串 → (主地址, 板号)；纯数字沿用界面板号
+    assert split_gpib_cfg("GPIB1::20::INSTR", 0) == ("20", 1)
+    assert split_gpib_cfg(" 20 ", 1) == ("20", 1)
+    assert split_gpib_cfg("10.38.26.112", 0) == ("10.38.26.112", 0)
+    # 报告/日志里的地址展示：LAN 带端口，VISA 串不带端口
+    assert link_desc("192.168.1.100", "5025") == "192.168.1.100:5025"
+    assert link_desc("GPIB0,20", "5025") == "GPIB0::20::INSTR"
+    assert link_desc("20", "5025") == "GPIB0::20::INSTR"    # 只填地址号不能显示成 20:5025
+    assert link_desc("", "5025") == "-"
+    # 记住的 GPIB 地址：默认 20 / 5，旧配置写在 *_ip 里也能迁移
+    assert CONFIG_DEFAULTS["cmw_gpib_addr"] == "20"
+    assert CONFIG_DEFAULTS["psu_gpib_addr"] == "5"
+    assert gpib_primary_only("GPIB0,5") == "5"
+    assert gpib_primary_only(" 20 ") == "20"
+    assert gpib_addr_mem({}, "cmw", "20") == "20"
+    assert gpib_addr_mem({"cmw_gpib_addr": " 21 "}, "cmw") == "21"
+    assert gpib_addr_mem({"cmw_ip": "GPIB1::20::INSTR"}, "cmw") == "20"
+    assert gpib_addr_mem({"cmw_ip": "10.38.26.112"}, "cmw", "20") == "20"
+    assert gpib_addr_mem({"cmw_gpib_addr": "abc"}, "cmw", "20") == "20"
+    # 当前接口实际使用的地址（日志/校验用）：GPIB 取 gpib_addr，LAN 取 ip
+    assert link_addr({"cmw_link": "GPIB", "cmw_gpib_addr": "20",
+                      "cmw_ip": "10.38.26.112"}, "cmw") == "20"
+    assert link_addr({"cmw_link": "LAN", "cmw_gpib_addr": "20",
+                      "cmw_ip": "10.38.26.112"}, "cmw") == "10.38.26.112"
+    assert link_addr({"cmw_ip": "20"}, "cmw") == "20"      # 旧配置只写了数字
+    assert normalize_cfg({})["cmw_gpib_addr"] == "20"
+    assert normalize_cfg({})["psu_gpib_addr"] == "5"
+    # 手误纠正：GPIB 打成 GPIO/GBIP、板号 0 打成字母 O 都要救回来（真机 18:44 事故）
+    assert clean_address("GPIO0::20::INSTR") == "GPIB0::20::INSTR"
+    assert clean_address("GPIO0,20") == "GPIB0,20"
+    assert clean_address("GBIP0::20") == "GPIB0::20"
+    assert clean_address("GPIBO0::20::INSTR") == "GPIB0::20::INSTR"
+    assert clean_address("GPIBO::20") == "GPIB::20"
+    assert fix_gpib_typo("gpio0:20") == "GPIB0:20"
+    # 但不能把主机名改坏（gpio-server 之类要原样保留）
+    assert clean_address("gpio-server") == "gpio-server"
+    assert clean_address("gpib-lab-pc") == "gpib-lab-pc"
+    assert normalize_visa_address("GPIO0::20::INSTR") == "GPIB0::20::INSTR"
+    # 传输层选择
+    _t, _d = open_scpi("192.168.1.100", 5025)
+    assert isinstance(_t, ScpiTransport) and _d == "192.168.1.100:5025", _d
+    _t2, _d2 = open_scpi("GPIB0,20", 5025)
+    assert isinstance(_t2, VisaTransport) and _d2 == "GPIB0::20::INSTR", _d2
+    # 地址框混填 ip:端口 → 端口以地址框为准
+    _t3, _d3 = open_scpi("10.38.26.112:5125", "5025")
+    assert isinstance(_t3, ScpiTransport) and _t3.port == 5125, _d3
+    assert _d3 == "10.38.26.112:5125", _d3
+    # 未连接时必须报 ScpiError，而不是 AttributeError/None 崩溃
+    try:
+        VisaTransport("GPIB0,20").write("SYST?")
+        assert False, "未连接的 VISA 传输应抛 ScpiError"
+    except ScpiError:
+        pass
     # INV/NAV 无效值解析（UE 未注册时 FETCH 返回 4,INV,INV,...）
     assert parse_values("4,INV,INV,NCAP") == [4.0, None, None, None]
     # Reliability 指示码（手册 p.1736）：首位单独解析用于精确诊断
@@ -3834,12 +5598,60 @@ def run_selftest():
     # 外部衰减成对补偿（手册 p.1729：OUTP 与 INP 成对，FDD 双工共用衰减器）
     assert "CONF:LTE:SIGN:RFS:EATT:OUTP 2.0" in joined, joined
     assert "CONF:LTE:SIGN:RFS:EATT:INP 2.0" in joined, joined
-    # FDC 频率响应校准（ASRrun V2.0.7 对比）——11 条命令：RCL + DELete + CREATE + 5×ADD + ACTivate TX + ACTivate RX
+    # FDC 频率响应校准：RCL + DELete + CREATE + (N-1)×ADD + ACTivate TX + ACTivate RX
+    # 逐点内容由 cfg 的 freq_loss_segments 决定，这里按当前默认表反推期望值，
+    # 避免改推荐表后断言失效
+    _segs = [s.strip() for s in str(cfg["freq_loss_segments"]).split(",") if ":" in s]
     assert "CONF:BASE:FDC:RCL" in joined, "FDC RCL"
-    assert "CONF:BASE:FDC:CTABle:CREATE 'losstable', 450000000, 0.3" in joined, "FDC CREATE"
-    assert "CONF:BASE:FDC:CTABle:ADD 'losstable', 1000000000, 0.5" in joined, "FDC ADD"
+    _f0, _l0 = _segs[0].split(":")
+    assert ("CONF:BASE:FDC:CTABle:CREATE 'losstable', %.0f, %s"
+            % (float(_f0) * 1e6, _fmt_db(float(_l0)))) in joined, "FDC CREATE"
+    _fN, _lN = _segs[-1].split(":")
+    assert ("CONF:BASE:FDC:CTABle:ADD 'losstable', %.0f, %s"
+            % (float(_fN) * 1e6, _fmt_db(float(_lN)))) in joined, "FDC ADD 末点"
+    assert joined.count("CONF:BASE:FDC:CTABle:ADD") == len(_segs) - 1, \
+        "FDC ADD 条数应为断点数-1（%d）" % (len(_segs) - 1)
     assert "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', TX" in joined, "FDC ACT TX"
     assert "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', RX" in joined, "FDC ACT RX"
+    # 推荐损耗表：粗粒度锚点（几百 MHz/1.x/2.x/3.5G/5G 几个台阶），覆盖全部支持频段
+    # （含 B46/B47 的 5.9GHz、B87/B88 的 410MHz），频率严格递增、损耗单调不降、
+    # 且只保留 1 位小数（经验值，不伪装成实测）
+    _pts = []
+    for _tok in str(CONFIG_DEFAULTS["freq_loss_segments"]).split(","):
+        if ":" not in _tok:
+            continue
+        _fq, _ls = _tok.split(":", 1)
+        _pts.append((float(_fq), float(_ls)))
+    _rng = supported_freq_ranges()
+    assert 5 <= len(_pts) <= 12, "粗粒度损耗表断点数应为 5~12: %d" % len(_pts)
+    assert _rng, "bands.json 未读到任何频段"
+    assert _pts[0][0] <= _rng[0][0] and _pts[-1][0] >= _rng[-1][1], \
+        "损耗表未覆盖支持频段 %s~%s" % (_rng[0][0], _rng[-1][1])
+    for _a, _b in zip(_pts, _pts[1:]):
+        assert _b[0] > _a[0], "损耗表频率未严格递增: %s → %s" % (_a[0], _b[0])
+        assert _b[1] >= _a[1], "损耗应随频率单调不降: %s → %s" % (_a, _b)
+    for _fq, _ls in _pts:
+        assert abs(_ls * 10 - round(_ls * 10)) < 1e-9, "损耗应为 1 位小数: %s:%s" % (_fq, _ls)
+    assert _pts[0][1] <= 0.5 and _pts[-1][1] <= 2.0, "损耗量级异常: %s" % (_pts,)
+    _lcfg = dict(CONFIG_DEFAULTS, freq_loss_enable=True)
+    for _lo, _hi in _rng:
+        _mid = (_lo + _hi) / 2.0
+        _v = lookup_loss_mhz(_lcfg, _mid)
+        assert _v is not None and 0.2 <= _v <= 2.0, \
+            "%.1f MHz 损耗异常: %s" % (_mid, _v)
+    # 损耗补偿只走 FDC：一次信道切换不应再出现任何 EATT 写入（否则 2× 补偿）
+    class _NullScpi:
+        def write(self, *_a, **_k):
+            pass
+
+        def query(self, *_a, **_k):
+            return "RDY"
+
+    _cmds = []
+    _apply_cell_params(_NullScpi(), _lcfg, "OB1", "B100", 300, _cmds.append)
+    assert not [c for c in _cmds if "EATT" in c], \
+        "FDC 生效时不应再下发 EATT: %s" % [c for c in _cmds if "EATT" in c]
+    assert build_fdc_commands(_lcfg), "FDC 表应能建成（%d 点）" % len(_pts)
     # RBP 固定 LOW（ASRrun 参考流程），避免切带宽/STYP 后位置残留
     assert "CONF:LTE:SIGN:CONN:RMC:RBP:DL LOW" in joined, "RBP DL"
     assert "CONF:LTE:SIGN:CONN:RMC:RBP:UL LOW" in joined, "RBP UL"
@@ -3849,6 +5661,115 @@ def run_selftest():
     assert "CONF:LTE:SIGN:CONN:RMC:UL N6,QPSK,KEEP" in "\n".join(_c14), "RB B014 UL"
     _c30, _ = build_signaling_init(dict(cfg), band="OB5", bw="B030")
     assert "CONF:LTE:SIGN:CONN:RMC:DL N15,QPSK,KEEP" in "\n".join(_c30), "RB B030"
+    # ---- 接收路径模式（PRX / DRX / PRX+DRX）----
+    assert norm_rx_path(None) == "prx" and norm_rx_path("bogus") == "prx"
+    assert rx_path_label("drx") == RX_PATH_LABELS["drx"]
+    # 端口严格按用户路由表，由模式派生；界面已无 RF口/RX 选择，cfg 里旧值应被忽略
+    assert rx_path_from_ui(RX_PATH_UI["drx"]) == "drx"
+    assert rx_path_ports("prx") == ("RF1C", "RX1")
+    assert rx_path_ports("drx") == ("RF2C", "RX1")
+    assert rx_path_ports("prx_drx") == ("RF1C", "RX1")
+    # PRX: SCEL RF1C,RX1,RF1C,TX1
+    _prx = "\n".join(build_signaling_init(dict(cfg, rx_path="prx"), band="OB2", bw="B100")[0])
+    assert "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF1C,TX1" in _prx, "PRX 路由"
+    assert "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', TX" in _prx
+    assert "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', RX" in _prx
+    # DRX: SCEL RF1C,RX1,RF2C,TX1（上行仍 RF1COM）
+    _drx_cfg = dict(cfg, rx_path="drx", rf="RF9C")  # 旧 rf 值应被忽略
+    _drx = "\n".join(build_signaling_init(_drx_cfg, band="OB2", bw="B100")[0])
+    assert "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF2C,TX1" in _drx, "DRX 路由"
+    assert "ROUT:LTE:SIGN:SCEN:MIMO22" not in _drx, "DRX 不应是 MIMO"
+    assert "CONFigure:FDCorrection:ACTivate RF2C, 'losstable', TX" in _drx, "DRX TX 校准口"
+    assert "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', RX" in _drx, "DRX RX 校准口"
+    # PRX+DRX: MIMO22 RF1C,RX1,RF1C,TX1,RF2C,TX3（第二路 RFTX3）
+    _mimo_cfg = dict(cfg, rx_path="prx_drx", rf="RF9C")
+    _mimo = "\n".join(build_signaling_init(_mimo_cfg, band="OB2", bw="B100")[0])
+    assert "ROUT:LTE:SIGN:SCEN:MIMO22 RF1C,RX1,RF1C,TX1,RF2C,TX3" in _mimo, "MIMO 路由(RFTX3)"
+    for _tok in ("CONF:LTE:SIGN:RFS:EATT:OUTP 2.0",
+                 "CONF:LTE:SIGN:CONN:RMC:DL1 N50,QPSK,KEEP",
+                 "CONF:LTE:SIGN:CONN:RMC:DL2 N50,QPSK,KEEP",
+                 "CONF:LTE:SIGN:CONN:RMC:RBP:DL1 LOW",
+                 "CONF:LTE:SIGN:CONN:RMC:RBP:DL2 LOW",
+                 "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', TX",
+                 "CONFigure:FDCorrection:ACTivate RF2C, 'losstable', TX",
+                 "CONFigure:FDCorrection:ACTivate RF1C, 'losstable', RX"):
+        assert _tok in _mimo, "MIMO 缺: " + _tok
+    assert "EATT:OUTP1" not in _mimo and "EATT:OUTP2" not in _mimo, "真机拒绝 EATT 后缀"
+    # 传输模式：MIMO22 灵敏度按 REFSENS 口径用 TM1（3GPP 36.521-1 第7章），
+    # 单路 PRX/DRX 保持仪表默认、不下发。
+    assert "CONF:LTE:SIGN:CONN:TRANsmission TM1" in _mimo, "MIMO 必须用 TM1"
+    assert "TRANsmission" not in _prx and "TRANsmission" not in _drx, "单路不下发 TM 命令"
+    assert "CONF:LTE:SIGN:CONN:TRANsmission TM1" in "\n".join(
+        build_transmission_mode_commands(_mimo_cfg)), "TM1 命令构造"
+    assert build_transmission_mode_commands(dict(cfg, rx_path="prx")) == [], "PRX 无 TM 命令"
+    # ---- 结构化 RF 口配置（rx_path_ports）----
+    assert rx_path_display("drx", None) == RX_PATH_UI["drx"], "默认显示串不变"
+    assert rx_path_display("prx_drx", None) == RX_PATH_UI["prx_drx"], "默认 MIMO 显示串"
+    _pcfg = dict(cfg, rx_path="drx")
+    _pcfg["rx_path_ports"] = {m: {"scenario": p["scenario"], "rx": list(p["rx"]),
+                                  "tx": [list(t) for t in p["tx"]]}
+                              for m, p in cfg["rx_path_ports"].items()}
+    _pcfg["rx_path_ports"]["drx"]["tx"] = [["RF3C", "TX2"]]
+    assert rx_path_display("drx", _pcfg) == "DRX 分集", "模式串只显示模式（端口在【RF口】）"
+    assert rx_path_from_ui(rx_path_display("drx", _pcfg)) == "drx", "动态显示串可反查模式"
+    assert build_rx_route_commands(_pcfg) == [
+        "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF3C,TX2"], "改端口后路由命令"
+    assert rx_path_ports("drx", _pcfg) == ("RF3C", "RX1"), "改端口后派生 rf/rx"
+    assert "ACTivate RF3C, 'losstable', TX" in "\n".join(
+        build_fdc_commands(dict(_pcfg, freq_loss_segments="450:0.3, 800:0.5"))), "改端口后 FDC"
+    _bad = dict(_pcfg)
+    _bad["rx_path_ports"] = dict(_pcfg["rx_path_ports"])
+    _bad["rx_path_ports"]["drx"] = {"rx": ["ZZ9C", "RX1"], "tx": [["RF2C", "TX1"]]}
+    assert normalize_rx_path_ports(_bad["rx_path_ports"])["drx"]["rx"] == (
+        "RF1C", "RX1"), "非法连接器回退默认"
+
+    # ---- RF 口组合：两套预设必须逐条还原真机日志里的路由命令 ----
+    # 旧台面 RF1COM/RF2COM（17:36~17:44 三份日志）与 RF3COM/RF4COM（19:10~19:14）
+    # 各三条路由，全部由「主集/分集」两行展开，换口不再手改 6 处
+    _p1 = normalize_rx_path_ports(rf_ports_from_combo("RF1+RF2"))
+    assert [rx_route_from_ports(m, _p1) for m in RX_PATH_MODES] == [
+        "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF1C,TX1",
+        "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF2C,TX1",
+        "ROUT:LTE:SIGN:SCEN:MIMO22 RF1C,RX1,RF1C,TX1,RF2C,TX3"], "RF1+RF2 三模式路由"
+    _p3 = normalize_rx_path_ports(rf_ports_from_combo("RF3+RF4"))
+    assert [rx_route_from_ports(m, _p3) for m in RX_PATH_MODES] == [
+        "ROUT:LTE:SIGN:SCEN:SCEL RF3C,RX2,RF3C,TX2",
+        "ROUT:LTE:SIGN:SCEN:SCEL RF3C,RX2,RF4C,TX2",
+        "ROUT:LTE:SIGN:SCEN:MIMO22 RF3C,RX2,RF3C,TX2,RF4C,TX4"], "RF3+RF4 三模式路由"
+    # 组合反查：两套预设都能反查回名字，手改的单口识别为自定义
+    assert combo_of_ports(_p1) == "RF1+RF2" and combo_of_ports(_p3) == "RF3+RF4"
+    assert combo_of_ports(_pcfg["rx_path_ports"]) is None, "手改端口应为自定义"
+    # 组合优先级高于 rx_path_ports（config 里同时存在时以组合为准）
+    assert rx_route_from_ports("prx", rx_ports_cfg(
+        {"rf_port_combo": "RF3+RF4", "rx_path_ports": _p1})) == \
+        "ROUT:LTE:SIGN:SCEN:SCEL RF3C,RX2,RF3C,TX2", "组合覆盖手写端口"
+    # FDC 校准口随组合走：RF3C 收 / RF3C+RF4C 发
+    _fdc3 = "\n".join(build_fdc_commands(
+        {"rx_path": "prx_drx", "rf_port_combo": "RF3+RF4", "freq_loss_enable": True,
+         "freq_loss_segments": "450:0.3, 800:0.5"}))
+    assert "ACTivate RF3C, 'losstable', TX" in _fdc3
+    assert "ACTivate RF4C, 'losstable', TX" in _fdc3
+    assert "ACTivate RF3C, 'losstable', RX" in _fdc3 and "RF1C" not in _fdc3
+    # 映射表：三行 + 表头，且每行的下行/上行都带 COM/转换器
+    _tbl = rf_path_table_text({"rf_port_combo": "RF3+RF4"})
+    assert _tbl.splitlines()[0].startswith("MODE") and len(_tbl.splitlines()) == 4
+    assert "RF3COM/RFTX2" in _tbl and "RF4COM/RFTX4" in _tbl
+    assert "RF3COM/RFRX2" in _tbl
+    assert "RF3+RF4" in rf_path_tip({"rf_port_combo": "RF3+RF4"}), "提示带组合名"
+    # 归一化：非法组合名 → 退回 rx_path_ports（不报错、不改端口）
+    assert normalize_cfg({"rf_port_combo": "RF9+RF10"})["rf_port_combo"] == ""
+    assert normalize_cfg({"rf_port_combo": "RF1+RF2"})["rx_path_ports"] == _p1
+
+    # UDCH 双流 DL（灵敏度的 UDCH 分支）
+    _ud = build_udch_commands("OB2", "B100", _mimo_cfg)
+    assert _ud["dl"] == "CONF:LTE:SIGN:CONN:UDCH:DL1 50,0,QPSK,KEEP"
+    assert "CONF:LTE:SIGN:CONN:UDCH:DL2 50,0,QPSK,KEEP" in _ud["dl_extra"]
+    assert build_udch_commands("OB2", "B100")["dl"] == \
+           "CONF:LTE:SIGN:CONN:UDCH:DL 50,0,QPSK,KEEP", "单路 UDCH 兼容"
+    # RMC 恢复（灵敏度测完切回）同样按模式出双流命令
+    _rst = "\n".join(restore_rmc_commands(_mimo_cfg, bw="B100"))
+    assert "CONF:LTE:SIGN:CONN:RMC:DL1 N50,QPSK,KEEP" in _rst
+    assert "CONF:LTE:SIGN:CONN:RMC:DL2 N50,QPSK,KEEP" in _rst
     # ---- TDD 支持 ----
     assert band_duplex("OB2") == "FDD" and band_duplex("OB5") == "FDD"
     assert band_duplex("OB34") == "TDD" and band_duplex("OB38") == "TDD"
@@ -3937,7 +5858,7 @@ def run_selftest():
     assert mp["set_max"] == "CONF:LTE:SIGN:UL:TPC:SET MAXPower", mp["set_max"]
     assert mp["settle"] == 2.5, mp["settle"]
     # 默认稳定时间 4s（缓解 Rel=3 Overdriven），配置缺失时也回退 4s
-    assert CONFIG_DEFAULTS["tpc_settle"] == "4"
+    assert CONFIG_DEFAULTS["tpc_settle"] == "2.5"
     assert build_force_maxpower_cmd({})["settle"] == 4.0
     assert CONFIG_DEFAULTS["sens_min_total"] == "50"
     # 功率档独立 Total 门限 + 切带宽后上行稳定等待
@@ -3955,7 +5876,7 @@ def run_selftest():
     assert CONFIG_DEFAULTS["tdd_detect"] == "0"
     assert CONFIG_DEFAULTS["fast_retune_busy_wait"] == "25"     # 首窗口未确认的忙期宽限确认
     assert CONFIG_DEFAULTS["init_popup_ms"] == "3000"
-    assert CONFIG_DEFAULTS["at_port"] == ""   # AT 口默认 auto，启动自动识别
+    assert CONFIG_DEFAULTS["at_port"] == ""   # AT 口默认空，下拉手动选择
     assert CONFIG_DEFAULTS["at_cmd"] == ""    # AT 指令输入框默认空，关闭/发送时持久化
     assert CONFIG_DEFAULTS["at_auto_recover"] == "1"   # 掉线 AT CFUN 自动恢复默认启用
     assert CONFIG_DEFAULTS["at_recover_wait"] == "60"  # CFUN=1 后回网等待（SIGN 抖动 3 轮提前判负）
@@ -3965,6 +5886,12 @@ def run_selftest():
     assert _at_recovery_port({"at_port": "auto"}) is None
     assert _at_recovery_port({"at_port": "COM4", "at_auto_recover": "0"}) is None
     assert _at_recovery_port({}) is None
+    # 默认 AT 口：modem device 优先，排除 modem device2 等次级口
+    assert pick_at_port([("COM9", "ASR Modem Device2"), ("COM5", "ASR Modem Device")]) == "COM5"
+    assert pick_at_port([("COM3", "ASR Modem Device 2"), ("COM7", "ASR Modem Device")]) == "COM7"
+    assert pick_at_port([("COM4", "USB Serial Port"), ("COM2", "ASR Modem Device2")]) == "COM2"
+    assert pick_at_port([("COM2", "ASR Modem Device2")]) == "COM2"   # 仅次级口时仍可用
+    assert pick_at_port([]) == ""
     # 盲扫命令
     b = build_bler_commands(cfg, -80.0)
     assert b["set_level"] == "CONF:LTE:SIGN:DL:RSEPre:LEVel -80.0"  # set_level 是扫描时动态传入的
@@ -4336,6 +6263,25 @@ def run_selftest():
         _r2 = measure_sensitivity(_s2, dict(cfg, bler_timeout="3"), {"sensitivity"},
                                   band="OB1", bw="B100", theory_seed=seed12)
         assert abs(_r2["result_epre"] - _knee) <= 0.11, (_knee, _r2["result_epre"])
+    # warmup 策略（2026-11-27）：同档热点续扫跳过预同步，省一次 600 子帧 INIT；
+    # Pmin 是否跟随由 sens_skip_warmup_low 控制；切档后首次测量始终 warmup。
+    _w_low = _SensScpi(knee=-125.0)
+    measure_sensitivity(_w_low, dict(cfg, bler_timeout="3"), {"sensitivity"},
+                        band="OB1", bw="B100", hotspot=-124.8, power_mode="low")
+    _w_off = _SensScpi(knee=-125.0)
+    measure_sensitivity(_w_off, dict(cfg, bler_timeout="3", sens_skip_warmup_low="0"),
+                        {"sensitivity"}, band="OB1", bw="B100",
+                        hotspot=-124.8, power_mode="low")
+    _w_first = _SensScpi(knee=-125.0)
+    measure_sensitivity(_w_first, dict(cfg, bler_timeout="3"), {"sensitivity"},
+                        band="OB1", bw="B100", hotspot=-124.8, power_mode="low",
+                        force_warmup=True)
+    assert _w_low.inits == _w_off.inits - 1, \
+        "sens_skip_warmup_low=0 时 Pmin 应多做一次 warmup（%d vs %d）" % (
+            _w_low.inits, _w_off.inits)
+    assert _w_first.inits == _w_off.inits, "force_warmup=True 应始终 warmup"
+    assert _w_low.levels and _w_low.levels[0] > -123.0, \
+        "同档热点续扫应从热点+margin 起步（不是 -85 全窗）"
     # --- TX/RX 分模块 + 灵敏度功率档 + 动态列 ---
     assert TX_METRIC_KEYS == ["maxpower", "aclr", "evm", "freqerr"]
     assert RX_METRIC_KEYS == ["sensitivity"]
@@ -4443,6 +6389,10 @@ def run_selftest():
         (_all[:3], _all[-3:], len(_all))
     _cmb_full, _skp_full = build_combos(["OB1"], {"OB1": ["B100"]}, full_scan=True)
     assert len(_cmb_full) == 501 and _cmb_full[0][3] == 50 and _cmb_full[-1][3] == 550
+    # 界面「N 测试点」必须与 build_combos 同口径：全信道开启后不能仍按 3 点算
+    assert band_points_count("OB1", "B100") == 3
+    assert band_points_count("OB1", "B100", True) == 501
+    assert band_points_count("OB1", "B100", True) == len(_cmb_full)
     assert CONFIG_DEFAULTS["full_scan"] is False
     # 宽表：一行一个组合，指标按列（UL RB+sens_limit 已移到 TX 指标后、灵敏度前）
     _metrics_all = {"sensitivity": True, "maxpower": True, "aclr": True, "evm": True,
@@ -4546,15 +6496,178 @@ def run_selftest():
     ov = measure_tx(ov_scpi, cfg_fast, {"maxpower", "evm", "aclr"})
     assert ov["valid"] is True and ov["reliability"] == 3, ov
     assert ov["overdriven_but_usable"] is True and ov["attempts"] == 1, ov
+    # 运行日志：每轮测试可重建到指定文件名（与结果文件同名）
+    import tempfile, shutil
+    td_log = tempfile.mkdtemp(prefix="cmw_log_")
+    lg = RunLogger(base_dir=td_log)
+    _lp = os.path.join(td_log, "logs", "LTE_20260101_000000.log")
+    lg.restart(_lp)
+    lg.write("round-check")
+    lg.close()
+    _lt = open(_lp, encoding="utf-8").read()
+    assert os.path.basename(lg.path) == "LTE_20260101_000000.log"
+    assert "round-check" in _lt and "启动时间" in _lt
+    shutil.rmtree(td_log, ignore_errors=True)
     # 导出
-    import tempfile
     td = tempfile.mkdtemp(prefix="cmw_self_")
     result = {"time": "2026-01-01T00:00:00", "cfg": cfg,
               "items": [{"combo": "B2 / 10MHz / 低(CH650)", "data": d,
                          "rows": rows, "wide": wide}]}
     ok, err = export_results(result, os.path.join(td, "r.xlsx"), os.path.join(td, "r.txt"))
     assert ok, err
+    # xlsx 版式：数值必须是数字单元格（文本型数字会带绿色三角）+ 全表居中 + 列宽自适应
+    assert xlsx_cell_value("-96.30") == -96.3 and xlsx_cell_value("12") == 12
+    assert xlsx_cell_value("50@0") == "50@0" and xlsx_cell_value("CH50") == "CH50"
+    assert xlsx_cell_value("—") == "—" and xlsx_cell_value("") is None
+    assert xlsx_number_format("-96.30") == "0.00" and xlsx_number_format("4") is None
+    try:
+        from openpyxl import load_workbook
+        _wb = load_workbook(os.path.join(td, "r.xlsx"))
+        _ws = _wb["测试结果"]
+        _vals = [c.value for c in _ws[2]]
+        for _i, _v in enumerate(wide):
+            if _i >= len(_vals):
+                break
+            if isinstance(_v, str) and _NUM_RE.fullmatch(_v.strip() or "x"):
+                assert not isinstance(_vals[_i], str), \
+                    "列 %s 的数值 %r 被写成了文本（Excel 会画绿色三角）" % (_i, _v)
+        for _row in _ws.iter_rows():
+            for _c in _row:
+                assert str(_c.alignment.horizontal) == "center", \
+                    "单元格 %s 未居中" % _c.coordinate
+        assert _ws.row_dimensions[1].height in (None,) or _ws.row_dimensions[1].height >= 15
+        for _c in _ws[1]:
+            _w = _ws.column_dimensions[_c.column_letter].width
+            assert _w and _w >= 6, "列 %s 宽度未自适应" % _c.column_letter
+        # 每个 sheet 都不许留文本型数字（Excel 会画绿三角）
+        _bad = []
+        for _sh in _wb.worksheets:
+            for _row in _sh.iter_rows():
+                for _c in _row:
+                    if isinstance(_c.value, str) and _NUM_RE.fullmatch(_c.value.strip()):
+                        _bad.append((_sh.title, _c.coordinate, _c.value))
+        assert not _bad, "仍有文本型数字（Excel 绿三角）: %s" % _bad[:5]
+        # 表头只能 2 行：每列宽度必须放得下最长一行，否则 Excel 会再折成第 3 行
+        for _sh in _wb.worksheets:
+            for _c in _sh[1]:
+                if not isinstance(_c.value, str):
+                    continue
+                assert _c.value.count("\n") <= 1, "表头本身超过 2 行: %r" % _c.value
+                _long = max(xlsx_text_width(x) for x in _c.value.split("\n"))
+                _w = _sh.column_dimensions[_c.column_letter].width
+                assert _w >= _long * 1.2 or _w >= 26, \
+                    "表头 %r 列宽 %.1f 不够（最长行 %.0f 字符），会被折成 3 行" % (
+                        _c.value, _w, _long)
+        # 结果页冻结首行 + 左 3 列（Band / BW / DL Channel）：横滚时不能丢参照
+        assert _ws.freeze_panes == "D2", "结果页 freeze_panes 应为 D2，实际 %r" % _ws.freeze_panes
+        # 配置页「值」列必须显式靠左（不设 alignment 时数字会靠右，同列参差）
+        _ws_cfg = _wb["测试配置"]
+        for _row in _ws_cfg.iter_rows():
+            for _c in _row:
+                assert str(_c.alignment.horizontal) == "left", \
+                    "配置页 %s 未靠左（%s）" % (_c.coordinate, _c.alignment.horizontal)
+        assert _ws_cfg["B2"].value is not None
+        # 灵敏度探底页「原始返回」列：宽度按内容展开（上限 RAW_COL_MAX_W）且自动换行
+        _ws_sens = _wb["灵敏度探底"]
+        _rawL = _ws_sens.cell(row=1, column=_ws_sens.max_column).column_letter
+        _rv = [str(_c.value) for _c in _ws_sens[_rawL][1:] if _c.value is not None]
+        _need = min(RAW_COL_MAX_W, max([xlsx_text_width(x) for x in _rv] or [0]) + 2)
+        _got = _ws_sens.column_dimensions[_rawL].width
+        assert _got >= max(26, _need) - 0.01, \
+            "原始返回列宽 %.1f 不足（需 %d）" % (_got, _need)
+        for _c in _ws_sens[_rawL][1:]:
+            assert _c.alignment.wrap_text and \
+                str(_c.alignment.horizontal) == "left", \
+                "原始返回列 %s 应左对齐 + 自动换行" % _c.coordinate
+        _wb.close()
+        # 过程中同步保存：detail=False 只出结果页/配置页（明细页 10 万行太重），
+        # path_xlsx=None 只写 txt —— 两者都必须在测量循环里可用而不抛异常
+        _snap_x = os.path.join(td, "snap.xlsx")
+        _snap_t = os.path.join(td, "snap.txt")
+        _snap_res = dict(result)
+        _snap_res.update({"snapshot": True, "progress": 1, "total": 7096})
+        _ok, _err = export_results(_snap_res, _snap_x, _snap_t, detail=False)
+        assert _ok, _err
+        _wb_s = load_workbook(_snap_x)
+        assert "测试结果" in _wb_s.sheetnames and "灵敏度探底" not in _wb_s.sheetnames, \
+            "detail=False 不应生成明细页，实际 %s" % _wb_s.sheetnames
+        _wb_s.close()
+        _st_txt = open(_snap_t, encoding="utf-8-sig").read()
+        assert "过程中快照" in _st_txt and "灵敏度探底明细" not in _st_txt, \
+            "快照 txt 必须标明未跑完且不含明细"
+        # 只写 txt（每组合都刷的那条路径）
+        os.remove(_snap_t)
+        _ok, _err = export_results(_snap_res, None, _snap_t, detail=False)
+        assert _ok and os.path.isfile(_snap_t), _err
+        assert os.path.getsize(_snap_t) > 200
+    except ImportError:
+        pass
+    print("[selftest] xlsx 版式 OK | 数值非文本 + 全表居中 + 列宽自适应")
+    # 断点续测：指纹稳定性 + 原子写读往返 + 坏文件/无进度容错
+    global CHECKPOINT_PATH
+    _td_ck = tempfile.mkdtemp(prefix="cmw_ck_")
+    _old_ck = CHECKPOINT_PATH
+    try:
+        CHECKPOINT_PATH = os.path.join(_td_ck, "state", "checkpoint.json")
+        _cfg_a = {"combos": [["OB5", "B014", "低", 2407], ["OB5", "B014", "中", 2525]],
+                  "band_bws": {"OB5": ["B014"]},
+                  "metrics": {"sensitivity": True, "evm": False},
+                  "power_scenario": "low", "rx_path": "prx",
+                  "rf_port_combo": "RF3+RF4", "sens_throughput": "95"}
+        _fp = resume_fingerprint(_cfg_a)
+        assert _fp == resume_fingerprint(dict(_cfg_a)), "同样配置的断点指纹必须稳定"
+        # 任何会换口径的改动都必须换指纹，否则会把两套口径拼进同一份报告
+        for _k, _v in (("metrics", {"sensitivity": True, "evm": True}),
+                       ("power_scenario", "high"),
+                       ("rf_port_combo", "RF1+RF2"),
+                       ("sens_throughput", "90")):
+            _c = dict(_cfg_a)
+            _c[_k] = _v
+            assert resume_fingerprint(_c) != _fp, "改 %s 后断点指纹应变化" % _k
+        assert read_checkpoint() is None, "没有断点文件时必须返回 None"
+        _st = {"version": CHECKPOINT_VERSION, "stamp": "20260101_000000",
+               "created_at": "2026-01-01T00:00:00",
+               "updated_at": "2026-01-01T01:00:00", "cfg_key": _fp,
+               "combos": _cfg_a["combos"], "total": 2, "done": 2,
+               "hotspots": [[["OB5", "B014", "low", "prx"], -104.5]]}
+        _ck_items = [{"combo": "x", "data": {"a": 1}, "rows": [], "wide": ["1"]},
+                     {"combo": "y", "data": {"a": 2}, "rows": [], "wide": ["2"]}]
+        assert write_checkpoint_meta(_st)
+        assert append_checkpoint_items(_ck_items)
+        _back = read_checkpoint()
+        assert _back and _back["done"] == 2 and len(_back["items"]) == 2
+        assert _back["cfg_key"] == _fp and _back["hotspots"][0][1] == -104.5
+        # 明细比 meta 少（meta 超前进度）→ done 以实际条数为准，不把没落盘的当已完成
+        _st_more = dict(_st)
+        _st_more["done"] = 3
+        _st_more["total"] = 3
+        assert write_checkpoint_meta(_st_more)
+        _back = read_checkpoint()
+        assert _back and _back["done"] == 2 and len(_back["items"]) == 2
+        # 明细比 meta 多（meta 落后）→ 截断到 done，多出的组合重测但不会错位
+        _st_less = dict(_st)
+        _st_less["done"] = 1
+        assert write_checkpoint_meta(_st_less)
+        _back = read_checkpoint()
+        assert _back and _back["done"] == 1 and len(_back["items"]) == 1
+        # done=0（一个都没测完）与损坏 JSON 都必须当作"无断点"，绝不能拦住启动
+        _st0 = dict(_st)
+        _st0["done"] = 0
+        assert write_checkpoint_meta(_st0) and read_checkpoint() is None
+        with open(CHECKPOINT_PATH, "w", encoding="utf-8") as _f:
+            _f.write('{"version": 1, "combos": [')
+        assert read_checkpoint() is None
+        clear_checkpoint()
+        assert read_checkpoint() is None and not os.path.isfile(checkpoint_items_path())
+        print("[selftest] 断点续测 OK | 指纹校验 + 明细追加/meta 原子写 + 坏文件容错")
+    finally:
+        CHECKPOINT_PATH = _old_ck
+        shutil.rmtree(_td_ck, ignore_errors=True)
     print("selftest OK | 命令校验通过 | 结果行=%d | 导出=%s" % (len(rows), "OK" if ok else err))
+    # VISA 只是可选项：本机没装运行库时 LAN 通路照常可用，仅 GPIB/USB 不可用
+    print("[selftest] 地址识别 OK | VISA 运行库：%s"
+          % ("可用（支持 GPIB/USB 资源串）" if visa_available()
+             else "未安装（仅 LAN Raw Socket 可用）"))
 
 
 def run_demo():
@@ -4596,9 +6709,11 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    - IP/端口/RF口/电压等全部自动保存到 config.json，下次启动自动恢复。
 
 1a. AT 控制（USB 串口 / 手动 debug）
-   - 位置：CMW500 配置行右侧「AT 控制」框。AT口 下拉框默认 auto，启动时
-     自动枚举 COM 口并逐个 AT 握手（描述含 modem/asr 的优先），命中的口
-     自动选中；也可手动点【检测】重探或直接填 COMx。
+   - 位置：CMW500 配置行右侧「AT 控制」框。点【检测】枚举全部 COM 口并填入
+     下拉框，默认选中描述为 modem device 的口（排除 modem device2 等次级口）；
+     每次点【检测】都会重新按该规则选择，之后手动选的口同样写入 config.json，
+     下次启动沿用；启动静默枚举不覆盖已保存选择，USB 换口导致 COM 号变化时
+     自动回落默认口。
    - 用法：指令框输入 AT 指令（如 AT+CFUN?、AT+CFUN=0、AT+CFUN=1）后点
      【发送】或回车。支持多条指令依次执行，用 ; 分隔（如
      AT+CFUN=0; AT+CFUN=1），同一串口会话内逐条下发，单条失败不中断后续。
@@ -4632,6 +6747,21 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    ★ 暂停/继续：测量中点【暂停】，线程在当前组合测完后挂起（已测数据全部
      保留、界面保持不动）；再点【继续】从下一组合接着测。暂停粒度为一个
      完整组合，不打断单个指标/灵敏度的 SCPI 测量序列。
+   ★ 断点续测（自动）：每测完一个组合立即把结果写进 state\checkpoint.json
+     （明细 checkpoint.items.jsonl 逐条追加 + 进度原子写），关窗口/掉电/崩溃
+     都不丢已完成的数据。下次启动工具时若发现未完成断点，且频段/带宽/指标/
+     场景/RF口/门限与断点完全一致，就弹一个倒计时窗（默认 10s，可【取消】），
+     到点自动初始化仪表（按待测的第一个组合建网）并接着测；已完成的行会回填
+     到结果表，跑完后与新数据合并导出成一份完整报告，断点自动清除。
+     配置不一致时不会自动续测（避免两套口径拼进同一份报告）；点【开始测量】
+     会提示「续测 / 从头测」。配置项：auto_resume / auto_resume_delay /
+     auto_resume_max_hours。
+   ★ 过程中同步保存：测试还在跑的时候，已完成的结果就会实时落到
+     result\LTE_<stamp>_partial.txt（每个组合结束即刷新，<10ms）和
+     _partial.xlsx（每 50 个组合或 10 分钟重建一次，7096 行一次约 4s）。
+     文件头标明「过程中快照·尚未跑完」和完成百分比，中途随时可以打开看进度，
+     不含「灵敏度探底」明细页（10 万行太重）。整轮跑完导出正式报告后这两个
+     文件自动删除。配置项：partial_save / partial_every / partial_interval。
 
 3. 指标说明
    - 功率 / ACLR / EVM / 频率误差：连接态下 Multi Evaluation
@@ -4790,13 +6920,12 @@ def _attach_band_tip(widget, band):
     widget.bind("<Leave>", hide)
 
 
-def _attach_full_scan_tip(widget):
-    """全信道扫描复选框悬停提示：说明范围与耗时。"""
-    text = ("全信道扫描（RX 灵敏度探底）\n"
-            "勾选后：每个已勾选频段×带宽，按 3GPP TS 36.101 口径枚举\n"
-            "该带宽下全部合法 DL EARFCN（含低/中/高之间所有信道），\n"
-            "逐信道执行灵敏度探底。信道数远多于默认 3 点，耗时显著增加。\n"
-            "未勾选：保持默认低/中/高三信道。")
+def _attach_tip(widget, text, mono=False):
+    """通用鼠标悬停提示：鼠标移到 widget 上弹出浅黄说明框，移开即消失。
+
+    text 可以是字符串，也可以是可调用对象（每次弹出时求值，用于随下拉选择变化的提示）。
+    mono=True 时用等宽字体渲染，用于贴表格（RF 路径映射表逐列对齐）。
+    """
     state = {"win": None}
 
     def show(_e=None):
@@ -4806,8 +6935,10 @@ def _attach_full_scan_tip(widget):
         win.wm_overrideredirect(True)
         win.wm_geometry("+%d+%d" % (widget.winfo_rootx() + 16,
                                     widget.winfo_rooty() + widget.winfo_height() + 2))
-        ttk.Label(win, text=text, background="#ffffe0", relief="solid",
-                  borderwidth=1, padding=(8, 5), justify="left").pack()
+        ttk.Label(win, text=text() if callable(text) else text,
+                  background="#ffffe0", relief="solid", borderwidth=1,
+                  padding=(8, 5), justify="left",
+                  font=("Consolas", 9) if mono else None).pack()
         state["win"] = win
 
     def hide(_e=None):
@@ -4817,6 +6948,79 @@ def _attach_full_scan_tip(widget):
 
     widget.bind("<Enter>", show)
     widget.bind("<Leave>", hide)
+
+
+def _attach_hint(entry, var, provider, color="#9aa0a6"):
+    """在输入框内显示灰色示例文字（placeholder），空值且未聚焦时可见。
+
+    不写进 textvariable，所以不会被当成配置值保存；提示内容由 provider 动态给出
+    （例如接口选 GPIB 时显示「主地址，如 20」，选 LAN 时显示「如 192.168.1.100」）。
+    返回一个刷新函数，供接口切换时调用。
+    """
+    lbl = tk.Label(entry.master, bg="#ffffff", fg=color, bd=0, padx=0, pady=0)
+
+    def refresh(*_args):
+        text = provider() if callable(provider) else str(provider or "")
+        try:
+            focused = entry.focus_get() is entry
+        except Exception:
+            focused = False
+        try:
+            disabled = str(entry.cget("state")) == "disabled"
+        except Exception:
+            disabled = False
+        if text and not str(var.get()).strip() and not focused and not disabled:
+            lbl.configure(text=text)
+            lbl.place(in_=entry, x=4, rely=0.5, anchor="w")
+            lbl.lift()
+        else:
+            lbl.place_forget()
+
+    var.trace_add("write", refresh)
+    entry.bind("<FocusIn>", refresh, add="+")
+    entry.bind("<FocusOut>", refresh, add="+")
+    entry.bind("<KeyRelease>", refresh, add="+")
+    lbl.bind("<Button-1>", lambda _e: entry.focus_set())
+    refresh()
+    return refresh
+
+
+def _fit_combo_width(combo, values, min_width=10, pad_chars=3):
+    """按候选项里最长的显示串自适应下拉框宽度，避免中文/括号被截断。
+
+    ttk 的 width 以「0」字符宽为单位，而中文、全角括号约占 2 个单位，
+    按字符数估算必然偏窄；这里用字体实际像素宽度折算，并留出下拉箭头的位置。
+    """
+    try:
+        font = tkfont.nametofont(str(combo.cget("font") or "TkTextFont"))
+    except Exception:
+        font = tkfont.nametofont("TkTextFont")
+    unit = max(1, font.measure("0"))
+    widest = max([font.measure(str(v)) for v in values] or [0])
+    chars = int(math.ceil(widest / float(unit))) + int(pad_chars)
+    return max(int(min_width), chars)
+
+
+def _attach_full_scan_tip(widget):
+    """全信道扫描复选框悬停提示：说明范围与耗时。"""
+    _attach_tip(widget,
+                "全信道扫描（RX 灵敏度探底）\n"
+                "勾选后：每个已勾选频段×带宽，按 3GPP TS 36.101 口径枚举\n"
+                "该带宽下全部合法 DL EARFCN（含低/中/高之间所有信道），\n"
+                "逐信道执行灵敏度探底。信道数远多于默认 3 点，耗时显著增加。\n"
+                "未勾选：保持默认低/中/高三信道。")
+
+
+def _attach_sensitivity_tip(widget):
+    """灵敏度探底复选框悬停提示：说明判据、扫描精度与耗时。"""
+    _attach_tip(widget,
+                "灵敏度探底（RX 指标）\n"
+                "勾选后：从强信号开始逐级降低下行 RS EPRE，以 Throughput ≥ 95%\n"
+                "（可在参数配置中调整）为判据，找仍满足门限的最低电平。\n"
+                "• 三级步进：粗扫 → 中步 → 精扫 0.1dB，兼顾速度与精度\n"
+                "• 同频段带宽相邻信道复用热点结果，减少重复扫描\n"
+                "• 每信道需多轮 BLER 测量，耗时较长；配合【全信道扫描】逐点累计\n"
+                "未勾选：只测 TX 指标，不执行灵敏度扫描。")
 
 
 LOG_BOX_LINES = 15    # 底部运行日志区可见行数（右侧带滚动条可回看历史）
@@ -4855,7 +7059,27 @@ class App(tk.Tk):
         # 避免手动发送与测量恢复同时开同一 COM 口报"资源在使用中"
         self._at_lock = _AT_SER_LOCK
 
+        # 断点续测：_resume_pending = 已确认要续的断点（初始化完成即自动开跑），
+        # _resume_start_idx = 初始化小区该按哪个组合建网（续测时不是第 1 个）
+        self._resume_pending = None
+        self._resume_start_idx = 0
+        self._run_created_at = ""
+        self._ckpt_warned = False
+        # 已写入断点明细的组合数：续测时 = 断点 done（明细已含这些行，不再重复追加）
+        self._ckpt_items_written = 0
+        # 过程中同步保存的限频状态（每轮重置，保证新一轮第一个组合就落一份）
+        self._snap_xlsx_ts = None
+        self._snap_warned_txt = False
+        self._snap_warned_xlsx = False
+
+        # 旧配置文件补写 rx_path_ports（只加字段，不动用户其它参数）
+        ensure_config_rx_ports()
         self.cfg_loaded = load_config()
+        try:
+            self._cfg_mtime = (os.path.getmtime(CONFIG_PATH)
+                               if os.path.isfile(CONFIG_PATH) else 0)
+        except OSError:
+            self._cfg_mtime = 0
         self._init_vars()
         try:
             self.run_log = RunLogger()
@@ -4867,6 +7091,9 @@ class App(tk.Tk):
         self.after(80, self._poll_queue)
         # 启动时静默探测 AT 口（后台线程，结果经队列回填下拉框）
         self.after(200, lambda: self._detect_at_ports(False))
+        # 断点续测：界面建好后检查 state\checkpoint.json，配置一致则倒计时自动续测
+        # （放在 2.5s 之后，等 AT 口探测与配置热同步先完成，避免抢跑改配置）
+        self.after(2500, self._auto_resume_check)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- 变量 ----------------
@@ -4877,16 +7104,50 @@ class App(tk.Tk):
         def B(key):
             return tk.BooleanVar(value=bool(c.get(key, CONFIG_DEFAULTS.get(key, False))))
 
-        # CMW500 行
-        self.ip_var = V("cmw_ip")
+        # 终测仪行（仪表型号下拉预留扩展；RF口/RX 由接收模式下拉自动决定）
+        self.instrument_var = V("instrument")   # 默认 CMW500，后续可扩展其它仪表
+        # 接口下拉（LAN/GPIB）：旧配置没有 cmw_link 时按已存地址推断，
+        # 避免升级后地址是 GPIB 串而接口显示 LAN
+        _cmw_link = str(c.get("cmw_link") or "").strip().upper()
+        _cmw_mode = (_cmw_link if _cmw_link in LINK_MODES
+                     else link_mode_from_address(c.get("cmw_ip", "")))
+        self.cmw_iface_var = tk.StringVar(value=_cmw_mode)
+        # GPIB 地址只填数字、板号单独选；旧配置里的 GPIB1::20::INSTR 自动拆开
+        _cmw_prim, _cmw_board = split_gpib_cfg(c.get("cmw_ip", ""),
+                                               c.get("cmw_gpib_board", 0))
+        # 记住的 GPIB 主地址（config 的 cmw_gpib_addr，默认 20）：切回 GPIB 自动回填
+        _cmw_gpib_mem = gpib_addr_mem(c, "cmw", CONFIG_DEFAULTS["cmw_gpib_addr"])
+        self.ip_var = tk.StringVar(
+            value=(_cmw_gpib_mem or _cmw_prim) if _cmw_mode == "GPIB"
+            else str(c.get("cmw_ip", "")))
         self.port_var = V("cmw_port")
-        self.rf_var = V("rf")
-        self.rx_var = V("rx")
+        self.cmw_board_var = tk.StringVar(value=gpib_board_label(_cmw_board))
+        _mode0 = norm_rx_path(rx_path_from_ui(c.get("rx_path", "prx")))
+        self.rx_path_var = tk.StringVar(value=rx_path_display(_mode0, c))
+        # RF 口组合：两套预设（RF1+RF2 / RF3+RF4）+「自定义（按 config）」
+        self.rf_combo_var = tk.StringVar(
+            value=combo_of_cfg(c) or RF_PORT_COMBO_CUSTOM)
 
-        # 电源行：默认启用，界面不再提供"启用"勾选框（固定 True，不读 config 旧值）
-        self.psu_enable_var = tk.BooleanVar(value=True)
-        self.psu_host_var = V("psu_ip")
+        # 电源行：型号下拉预留扩展；"程控"复选框控制是否初始化/测量电源
+        self.psu_model_var = V("psu_model")     # 默认 E36312A，后续可扩展其它电源
+        self.psu_enable_var = B("psu_enable")   # 勾选才程控电源（读 config，默认 True）
+        _psu_link = str(c.get("psu_link") or "").strip().upper()
+        _psu_mode = (_psu_link if _psu_link in LINK_MODES
+                     else link_mode_from_address(c.get("psu_ip", "")))
+        self.psu_iface_var = tk.StringVar(value=_psu_mode)
+        _psu_prim, _psu_board = split_gpib_cfg(c.get("psu_ip", ""),
+                                               c.get("psu_gpib_board", 0))
+        _psu_gpib_mem = gpib_addr_mem(c, "psu", CONFIG_DEFAULTS["psu_gpib_addr"])
+        self.psu_host_var = tk.StringVar(
+            value=(_psu_gpib_mem or _psu_prim) if _psu_mode == "GPIB"
+            else str(c.get("psu_ip", "")))
+        # 地址记忆：{设备: {"LAN": IP, "GPIB": 主地址}}，切换接口时互相回填
+        self._addr_mem_store = {
+            "cmw": {"LAN": str(c.get("cmw_ip") or ""), "GPIB": _cmw_gpib_mem},
+            "psu": {"LAN": str(c.get("psu_ip") or ""), "GPIB": _psu_gpib_mem},
+        }
         self.psu_port_var = V("psu_port")
+        self.psu_board_var = tk.StringVar(value=gpib_board_label(_psu_board))
         self.psu_channel_var = V("psu_channel")
         self.psu_voltage_var = V("psu_voltage")
         # psu_readv 不再有勾选框：电压/电流默认记录，下发给 True
@@ -4957,85 +7218,260 @@ class App(tk.Tk):
         if "clam" in style.theme_names():
             style.theme_use("clam")
         self._install_checkmark_style(style)
+        # 行内小按钮（检测/发送）：压缩内边距使按钮高度与 Combobox/Entry 一致（23px），
+        # 避免 AT 行被按钮撑高，三个设置框才能同高
+        style.configure("Inline.TButton", padding=(6, 0))
+        # 下拉框统一白底：clam 主题下 readonly 状态的 fieldbackground 是 #dcdad5（灰），
+        # 看起来像被禁用，与可编辑下拉/输入框（白底）不一致。仪表、接收模式、电源、
+        # 通道、AT 口全部是只读下拉，这里统一成白底黑字（含获得焦点时，避免整格变深蓝）。
+        # disabled 单独给浅灰底 + 灰字：否则（clam 下 disabled 无独立底色）置灰的
+        # 【板号】看起来和可选的只读下拉一模一样，用户分不清能不能点。
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", "#ffffff"),
+                                   ("readonly", "focus", "#ffffff"),
+                                   ("disabled", "#f0f0f0")],
+                  foreground=[("readonly", "#000000"),
+                              ("readonly", "focus", "#000000"),
+                              ("disabled", "#9aa0a6")])
+        style.map("TEntry",
+                  fieldbackground=[("disabled", "#f0f0f0")],
+                  foreground=[("disabled", "#9aa0a6")])
 
         root = ttk.Frame(self, padding=(10, 2))
         root.pack(fill="both", expand=True)
+        # GPIB 地址框的按键校验：只允许 0~2 位数字（主地址 0~30）
+        self._gpib_vcmd = (self.register(gpib_primary_typing_ok), "%P")
 
-        # ===== 第1行：CMW500 配置 + 操作按钮（并排两个容器，grid 底部对齐） =====
-        top_row = ttk.Frame(root)
-        top_row.pack(fill="x", pady=(0, 6))
-        top_row.columnconfigure(0, weight=1)  # f1 自然撑满左边
-        # CMW500 配置框
-        f1 = ttk.LabelFrame(top_row, text="CMW500 配置（网线 / Raw Socket 5025）", padding=(8, 5))
-        f1.grid(row=0, column=0, sticky="w")
-        ttk.Label(f1, text="IP:").grid(row=0, column=0, sticky="w", padx=(2, 4))
-        ttk.Entry(f1, textvariable=self.ip_var, width=15).grid(row=0, column=1, sticky="w")
-        ttk.Label(f1, text="端口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
-        ttk.Entry(f1, textvariable=self.port_var, width=7).grid(row=0, column=3, sticky="w")
-        ttk.Label(f1, text="RF口:").grid(row=0, column=4, sticky="w", padx=(16, 4))
-        ttk.Combobox(f1, textvariable=self.rf_var, values=RF_CONNECTORS,
-                     width=8, state="readonly").grid(row=0, column=5, sticky="w")
-        ttk.Label(f1, text="RX:").grid(row=0, column=6, sticky="w", padx=(8, 4))
-        ttk.Combobox(f1, textvariable=self.rx_var, values=RX_CONNECTORS,
-                     width=6, state="readonly").grid(row=0, column=7, sticky="w")
+        # ===== 第1/2/3行：终测仪 / 电源 / AT 三个设置框 =====
+        # 三者同处一列（col0, weight=1）→ 宽度完全一致；右侧为操作按钮列（col1）。
+        # 三行同属 uniform 分组 → 行高统一，三个外框大小完全相同。
+        set_row = ttk.Frame(root)
+        set_row.pack(fill="x", pady=(0, 6))
+        set_row.columnconfigure(0, weight=1)
+        for _r in (0, 1, 2):
+            set_row.rowconfigure(_r, weight=1, uniform="setframe")
+        f1 = ttk.LabelFrame(set_row, text="终测仪设置", padding=(8, 5))
+        f1.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        # 列 0/1 仪表、2/3 接口(LAN|GPIB)、4/5 板号、6/7 地址、8/9 接收模式，
+        # 与下方电源设置行逐列对齐（两行插同样的列，原有对齐关系不变）
+        ttk.Label(f1, text="仪表:").grid(row=0, column=0, sticky="w", padx=(2, 4))
+        self.instrument_cb = ttk.Combobox(f1, textvariable=self.instrument_var,
+                                          values=["CMW500"], width=10, state="readonly")
+        self.instrument_cb.grid(row=0, column=1, sticky="w")
+        ttk.Label(f1, text="接口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
+        self.cmw_iface_cb = ttk.Combobox(f1, textvariable=self.cmw_iface_var,
+                                         values=list(LINK_MODES), width=5, state="readonly")
+        self.cmw_iface_cb.grid(row=0, column=3, sticky="w")
+        self.cmw_iface_cb.bind("<<ComboboxSelected>>",
+                               lambda _e: self._on_link_mode_change("cmw"))
+        _attach_tip(self.cmw_iface_cb,
+                    "终测仪的连接接口：\n"
+                    "• LAN = 网线直连，地址填 IP（Raw Socket，端口固定 5025）\n"
+                    "• GPIB = IEEE 488，地址只填一个数字（主地址 0~30，出厂 20）\n"
+                    "  · 板号在右侧【板号】下拉选（GPIB0 = 1 号卡，GPIB1 = 2 号卡）\n"
+                    "  · CMW500 的 GPIB 是选件 CMW-B612A/B612B\n"
+                    "  · 需本机已装 NI-VISA + NI-488.2（或 Keysight IO Libraries）\n"
+                    "• 切换后地址框的提示文字会跟着变")
+        ttk.Label(f1, text="板号:").grid(row=0, column=4, sticky="w", padx=(8, 4))
+        self.cmw_board_cb = ttk.Combobox(f1, textvariable=self.cmw_board_var,
+                                         values=[gpib_board_label(b) for b in GPIB_BOARDS],
+                                         width=6, state="readonly")
+        self.cmw_board_cb.grid(row=0, column=5, sticky="w")
+        _attach_tip(self.cmw_board_cb,
+                    "GPIB 接口卡的板号（仅 GPIB 方式有效）：\n"
+                    "• GPIB0 = 本机第 1 块 GPIB 卡（CMW500 后面板 CH1）\n"
+                    "• GPIB1 = 第 2 块卡（接 CH2 时才选）\n"
+                    "• 在 NI-MAX 的 Devices and Interfaces 里能看到实际板号\n"
+                    "• LAN 方式下本框置灰不参与")
+        self.cmw_addr_lbl_var = tk.StringVar(value="IP 地址:")
+        ttk.Label(f1, textvariable=self.cmw_addr_lbl_var, width=10,
+                  anchor="w").grid(row=0, column=6, sticky="w", padx=(8, 4))
+        self.cmw_addr_entry = ttk.Entry(f1, textvariable=self.ip_var, width=14)
+        self.cmw_addr_entry.grid(row=0, column=7, sticky="w")
+        _attach_tip(self.cmw_addr_entry,
+                    lambda: link_tip("CMW500", self.cmw_iface_var.get(),
+                                     "CMW500 的 GPIB 为选件 CMW-B612A/B612B，出厂主地址 20"))
+        self._cmw_hint = _attach_hint(self.cmw_addr_entry, self.ip_var,
+                                      lambda: self._addr_hint("cmw"))
+        # 接收模式：PRX / DRX / PRX+DRX，端口由参数配置的 rx_path_ports 派生
+        ttk.Label(f1, text="接收模式:").grid(row=0, column=8, sticky="w", padx=(10, 4))
+        _rx_vals = self._rx_path_ui_values()
+        # 宽度按最长显示串实测（如「PRX+DRX 双流（RF1C+RF2C）」，
+        # 若在参数配置里把上行口改成 RF3C 还会更长），固定 width 会截断
+        self.rx_path_cb = ttk.Combobox(
+            f1, textvariable=self.rx_path_var,
+            values=_rx_vals, width=14, state="readonly")
+        self.rx_path_cb.configure(width=_fit_combo_width(self.rx_path_cb, _rx_vals,
+                                                        min_width=14))
+        self.rx_path_cb.grid(row=0, column=9, sticky="w")
+        # 端口映射改为悬停提示，保持本行紧凑；提示内容随下拉选择实时生成
+        _attach_tip(self.rx_path_cb,
+                    lambda: "接收模式：%s\n端口路由：%s\n"
+                            "（RF 口在右侧【RF口】下拉切换，或参数配置 rx_path_ports）" % (
+                        self.rx_path_var.get(),
+                        rx_path_desc(rx_path_from_ui(self.rx_path_var.get()),
+                                     self.cfg_loaded)))
+        # RF 口组合：两套预设下拉，选完三种模式的路由/校准口自动展开；
+        # 悬停提示里直接给映射表（等宽字体逐列对齐），换口不用再翻日志推
+        ttk.Label(f1, text="RF口:").grid(row=0, column=10, sticky="w", padx=(10, 4))
+        _rf_vals = list(RF_PORT_COMBOS) + [RF_PORT_COMBO_CUSTOM]
+        self.rf_combo_cb = ttk.Combobox(f1, textvariable=self.rf_combo_var,
+                                        values=_rf_vals, width=10, state="readonly")
+        self.rf_combo_cb.grid(row=0, column=11, sticky="w")
+        self.rf_combo_cb.bind("<<ComboboxSelected>>", self._on_rf_combo_change)
+        _attach_tip(self.rf_combo_cb, lambda: rf_path_tip(self.cfg_loaded), mono=True)
         self.conn_label = ttk.Label(f1, text="● 未连接", foreground="#888888")
-        self.conn_label.grid(row=0, column=8, sticky="w", padx=(12, 2))
+        self.conn_label.grid(row=0, column=12, sticky="w", padx=(12, 2))
+        self._apply_link_mode("cmw")    # 按初始接口刷新板号/地址框状态与提示
 
-        # AT 控制 Frame（手动 debug 用：AT 口选择/自动识别 + 指令输入 + 发送）。
-        # grid sticky="s" 让底部与 f1 内控件对齐。
-        f_at = ttk.LabelFrame(top_row, text="AT 控制（USB 串口 / 手动 debug）", padding=(8, 5))
-        f_at.grid(row=0, column=1, sticky="s", padx=(10, 0))
+        # ===== 第2行：电源设置（与终测仪设置逐列对齐；程控在电压输入框之后） =====
+        f2 = ttk.LabelFrame(set_row, text="电源设置", padding=(8, 5))
+        self.psu_frame = f2
+        f2.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        ttk.Label(f2, text="电源:").grid(row=0, column=0, sticky="w", padx=(2, 4))
+        self.psu_model_cb = ttk.Combobox(f2, textvariable=self.psu_model_var,
+                                         values=["E36312A"], width=10, state="readonly")
+        self.psu_model_cb.grid(row=0, column=1, sticky="w")
+        ttk.Label(f2, text="接口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
+        self.psu_iface_cb = ttk.Combobox(f2, textvariable=self.psu_iface_var,
+                                         values=list(LINK_MODES), width=5, state="readonly")
+        self.psu_iface_cb.grid(row=0, column=3, sticky="w")
+        self.psu_iface_cb.bind("<<ComboboxSelected>>",
+                               lambda _e: self._on_link_mode_change("psu"))
+        _attach_tip(self.psu_iface_cb,
+                    "电源的连接接口：\n"
+                    "• LAN = 网线直连，地址填 IP（Raw Socket，端口固定 5025）\n"
+                    "• GPIB = IEEE 488，地址只填一个数字（如 5，范围 0~30）\n"
+                    "  · E36312A 的 GPIB 为选件 GPB（可后装 E363GPBU）\n"
+                    "  · 需本机已装 NI-VISA + NI-488.2；实际地址以面板 I/O 配置为准\n"
+                    "• 仅勾选【程控】时才会连接；切换后地址框提示会跟着变")
+        ttk.Label(f2, text="板号:").grid(row=0, column=4, sticky="w", padx=(8, 4))
+        self.psu_board_cb = ttk.Combobox(f2, textvariable=self.psu_board_var,
+                                         values=[gpib_board_label(b) for b in GPIB_BOARDS],
+                                         width=6, state="readonly")
+        self.psu_board_cb.grid(row=0, column=5, sticky="w")
+        _attach_tip(self.psu_board_cb,
+                    "GPIB 接口卡的板号（仅 GPIB 方式有效）：\n"
+                    "• GPIB0 = 本机第 1 块 GPIB 卡（通常电源接在这条总线上）\n"
+                    "• GPIB1 = 第 2 块卡\n"
+                    "• 在 NI-MAX 的 Devices and Interfaces 里可确认\n"
+                    "• LAN 方式下本框置灰不参与")
+        self.psu_addr_lbl_var = tk.StringVar(value="IP 地址:")
+        ttk.Label(f2, textvariable=self.psu_addr_lbl_var, width=10,
+                  anchor="w").grid(row=0, column=6, sticky="w", padx=(8, 4))
+        self.psu_addr_entry = ttk.Entry(f2, textvariable=self.psu_host_var, width=14)
+        self.psu_addr_entry.grid(row=0, column=7, sticky="w")
+        _attach_tip(self.psu_addr_entry,
+                    lambda: link_tip("E36312A", self.psu_iface_var.get(),
+                                     "E36312A 的 GPIB 为选件 GPB（可后装 E363GPBU），"
+                                     "主地址以面板 I/O 配置为准") +
+                    "\n• 仅勾选【程控】时才会连接；不程控时可留空")
+        self._psu_hint = _attach_hint(self.psu_addr_entry, self.psu_host_var,
+                                      lambda: self._addr_hint("psu"))
+        ttk.Label(f2, text="通道:").grid(row=0, column=8, sticky="w", padx=(10, 4))
+        ch = ttk.Combobox(f2, textvariable=self.psu_channel_var, values=list(PSU_CHANNELS),
+                          width=8, state="readonly")
+        ch.grid(row=0, column=9, sticky="w")
+        _attach_tip(ch,
+                    "电源输出通道（E36312A）：\n"
+                    "• P6V = CH1，0 ~ 6.18 V\n"
+                    "• P25V = CH2，0 ~ +25.75 V\n"
+                    "• N25V = CH3，0 ~ +25.75 V（正电压）\n"
+                    "• 注：N25V 是 SCPI 通道标识符，E36312A 正常模式下输出正电压；"
+                    "负电压仅见于 E36311A 或 E3631A 兼容模式")
+        ttk.Label(f2, text="电压(V):").grid(row=0, column=10, sticky="w", padx=(8, 4))
+        psu_volt_entry = ttk.Entry(f2, textvariable=self.psu_voltage_var, width=9)
+        psu_volt_entry.grid(row=0, column=11, sticky="w")
+        _attach_tip(psu_volt_entry, lambda: (
+            "输出电压（V），范围随通道变化：\n"
+            "• P6V: 0 ~ 6.18 V\n• P25V: 0 ~ +25.75 V\n• N25V: 0 ~ +25.75 V（CH3 正电压）\n"
+            "• 当前通道 %s（%s），超限会被拒绝" % (
+                self.psu_channel_var.get(),
+                PSU_VOLT_RANGE.get(self.psu_channel_var.get(), (0, 0, "未知"))[2])))
+        # 程控复选框：勾选才初始化/测量电源；放在电压输入框之后
+        self.psu_enable_cb = ttk.Checkbutton(f2, text="程控", variable=self.psu_enable_var,
+                                            command=self._on_psu_enable_change)
+        self.psu_enable_cb.grid(row=0, column=12, sticky="w", padx=(10, 2))
+        self.psu_label = ttk.Label(f2, text="● 未连接", foreground="#888888")
+        self.psu_label.grid(row=0, column=13, sticky="w", padx=(10, 2))
+        self._on_psu_enable_change()  # 按勾选状态刷新电源控件可用状态
+
+        # 参数配置 / 频段参数：右侧每行一个；上边距 18px 抵消 LabelFrame 标题占位，
+        # 使按钮中心与同行输入框中心齐平（实测偏差 0 px）
+        self.btn_open_cfg = ttk.Button(set_row, text="参数配置", command=self._open_config, width=12)
+        self.btn_open_cfg.grid(row=0, column=1, sticky="e", padx=(10, 2), pady=(18, 0))
+        _attach_tip(self.btn_open_cfg,
+                    "打开 config.json（系统默认编辑器），保存后界面自动同步：\n"
+                    "• cmw_link / psu_link：接口下拉 LAN | GPIB\n"
+                    "• cmw_ip / psu_ip：只存 LAN 地址（IP / 主机名）\n"
+                    "• cmw_gpib_addr / psu_gpib_addr：只存 GPIB 主地址数字（默认 20 / 5），"
+                    "切到 GPIB 时自动回填，不用重敲\n"
+                    "• cmw_gpib_board / psu_gpib_board：GPIB 板号 0 | 1\n"
+                    "• cmw_port / psu_port：LAN 端口（默认 5025，界面已隐藏）\n"
+                    "• rf_port_combo：RF 口组合，换口只改这一行\n"
+                    "  RF1+RF2 = RF1COM主集/RF2COM分集（TX1/TX3，RX1）\n"
+                    "  RF3+RF4 = RF3COM主集/RF4COM分集（TX2/TX4，RX2）\n"
+                    "  选中后 PRX/DRX/PRX+DRX 的路由与 FDC 校准口自动展开\n"
+                    "• rx_path_ports：手写端口表（组合留空时生效，自定义接法用）\n"
+                    "  改完界面下拉与悬停映射表自动刷新",
+                    "• freq_loss_segments / freq_loss_enable：FDC 线缆损耗分段校准表\n"
+                    "  粗粒度经验值（1 位小数）：≤1 GHz 0.3、1.x~2.2 GHz 0.5、\n"
+                    "  2.3 GHz 以上 0.7、3.5 GHz 1.0、5 GHz 段 1.5 dB\n"
+                    "  实测 2 GHz 损耗 X dB → 用 --loss-table X 重算整表后替换本行\n"
+                    "• eatt：外部衰减（dB）；init_popup_ms：提示框停留时长\n"
+                    "• 测量进行中不刷新配置，结束或下次初始化时生效")
+        self.btn_open_specs = ttk.Button(set_row, text="频段参数", command=self._open_specs, width=12)
+        self.btn_open_specs.grid(row=1, column=1, sticky="e", padx=(10, 2), pady=(18, 0))
+        _attach_tip(self.btn_open_specs,
+                    "打开 specs 目录（bands / ul_cfg / refsens / lte_channels）：\n"
+                    "• 频段表、UL 配置、参考灵敏度均按 3GPP R19 快照配置，默认无需修改\n"
+                    "• 仅在新增频段或校准参考灵敏度时调整\n"
+                    "• 文件读取有缓存，改完建议重启工具后生效")
+
+        # ===== 第3行：AT 控制（与上面两个框同列同高，右侧放操作按钮） =====
+        f_at = ttk.LabelFrame(set_row, text="AT 控制", padding=(8, 5))
+        f_at.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
         ttk.Label(f_at, text="AT口:").grid(row=0, column=0, sticky="w", padx=(2, 4))
+        # 旧配置残留的 auto 过渡为空；下拉只列实际 COM 口，由用户手动选择
+        if str(self.at_port_var.get()).strip().lower() == "auto":
+            self.at_port_var.set("")
+        try:
+            _ports0 = [p.device for p in serial.tools.list_ports.comports()] if serial else []
+        except Exception:
+            _ports0 = []
         self.at_port_cb = ttk.Combobox(f_at, textvariable=self.at_port_var,
-                                       values=["auto"], width=10)
+                                       values=_ports0, width=10, state="readonly")
         self.at_port_cb.grid(row=0, column=1, sticky="w")
-        self.btn_at_detect = ttk.Button(f_at, text="检测", width=4,
+        # 选择即落盘：下次启动沿用该口（不依赖关闭时的完整配置校验）
+        self.at_port_cb.bind("<<ComboboxSelected>>",
+                             lambda _e: self._save_at_port_only())
+        self.at_port_cb.bind("<Return>", lambda _e: self._save_at_port_only())
+        self.btn_at_detect = ttk.Button(f_at, text="检测", width=4, style="Inline.TButton",
                                         command=lambda: self._detect_at_ports(True))
         self.btn_at_detect.grid(row=0, column=2, sticky="w", padx=(4, 0))
         ttk.Label(f_at, text="指令:").grid(row=0, column=3, sticky="w", padx=(10, 4))
-        self.at_cmd_entry = ttk.Entry(f_at, textvariable=self.at_cmd_var, width=22)
+        self.at_cmd_entry = ttk.Entry(f_at, textvariable=self.at_cmd_var, width=48)
         self.at_cmd_entry.grid(row=0, column=4, sticky="w")
+        _attach_tip(self.at_cmd_entry,
+                    "AT 指令输入（回车或点【发送】执行）\n"
+                    "• 单条：AT+CFUN?\n"
+                    "• 多条：用 ; 或中文 ； 分隔，依次下发\n"
+                    "  例：AT+CFUN=0; AT+CFUN=1\n"
+                    "• 每条读到 OK/ERROR 或 8s 超时，单条失败不中断后续\n"
+                    "• 点【检测】枚举 COM 口并填入下拉，重选 modem device（排除 device2）\n"
+                    "• 检测后手动改选的口会自动保存，下次启动沿用")
         self.at_cmd_entry.bind("<Return>", lambda _e: self._send_at_cmd())
-        self.btn_at_send = ttk.Button(f_at, text="发送", width=5,
+        self.btn_at_send = ttk.Button(f_at, text="发送", width=5, style="Inline.TButton",
                                       command=self._send_at_cmd)
         self.btn_at_send.grid(row=0, column=5, sticky="w", padx=(4, 2))
-
-        # ===== 第2行：电源配置 =====
-        f2 = ttk.LabelFrame(root, text="电源配置（Keysight E36312A / LAN 5025）", padding=(8, 5))
-        f2.pack(fill="x", pady=(0, 6))
-        # 电源默认启用，去掉"启用"勾选框；各控件左对齐、无缝隙
-        ttk.Label(f2, text="IP:").grid(row=0, column=0, sticky="w", padx=(2, 4))
-        ttk.Entry(f2, textvariable=self.psu_host_var, width=15).grid(row=0, column=1, sticky="w")
-        ttk.Label(f2, text="端口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
-        ttk.Entry(f2, textvariable=self.psu_port_var, width=7).grid(row=0, column=3, sticky="w")
-        ttk.Label(f2, text="通道:").grid(row=0, column=4, sticky="w", padx=(16, 4))
-        ch = ttk.Combobox(f2, textvariable=self.psu_channel_var, values=list(PSU_CHANNELS),
-                          width=8, state="readonly")
-        ch.grid(row=0, column=5, sticky="w")
-        ttk.Label(f2, text="电压(V):").grid(row=0, column=6, sticky="w", padx=(8, 4))
-        ttk.Entry(f2, textvariable=self.psu_voltage_var, width=9).grid(row=0, column=7, sticky="w")
-        # 电压范围提示已去掉（界面更紧凑）；范围校验仍在 _read_cfg 里按 PSU_VOLT_RANGE 执行
-        self.psu_label = ttk.Label(f2, text="● 未连接", foreground="#888888")
-        self.psu_label.grid(row=0, column=8, sticky="w", padx=(10, 2))
-
-        # 操作按钮 Frame：靠右放置，末按钮右缘与上方 AT 控制区【发送】按钮右缘对齐
-        #   f_at 发 送 右缘 = top_row 右缘 -10(f_at padding) -2(btn padx)；
-        #   f2 内容右缘 = root 内容右缘 -8(f2 padding)，fbtn sticky="e" 贴右缘，
-        #   末按钮 padx 右=2 → 与发送按钮右缘重合。
-        fbtn = ttk.Frame(f2)
-        fbtn.grid(row=0, column=9, sticky="se", padx=(10, 0))
-        f2.columnconfigure(9, weight=1)
-        self.btn_init = ttk.Button(fbtn, text="初始化仪表", command=self.initialize, width=10)
-        self.btn_init.pack(side="left", padx=(2, 4))
+        # 操作按钮：初始化仪表 → 开始测量；上边距 22px 与 AT 输入框中心对齐
+        fbtn = ttk.Frame(set_row)
+        fbtn.grid(row=2, column=1, sticky="e", padx=(10, 2), pady=(22, 4))
+        self.btn_init = ttk.Button(fbtn, text="初始化仪表", command=self.initialize, width=12)
+        self.btn_init.pack(side="left", padx=(0, 4))
         self.btn_measure = ttk.Button(fbtn, text="开始测量", command=self.start_measurement,
-                                      width=10)
-        self.btn_measure.pack(side="left", padx=(0, 4))
-        self.btn_open_cfg = ttk.Button(fbtn, text="打开配置", command=self._open_config,
-                                       width=10)
-        self.btn_open_cfg.pack(side="left", padx=(0, 4))
-        self.btn_open_specs = ttk.Button(fbtn, text="打开频段表", command=self._open_specs,
-                                         width=10)
-        self.btn_open_specs.pack(side="left", padx=(0, 2))
+                                      width=12)
+        self.btn_measure.pack(side="left")
 
         # ===== 中间：频段 → 带宽 → 指标，自上而下依次分布 =====
         mid = ttk.Frame(root)
@@ -5065,11 +7501,13 @@ class App(tk.Tk):
                                                textvariable=self.sens_low_power_var)
         self.sens_low_power_entry.grid(row=0, column=4, sticky="w", padx=(0, 2))
         ttk.Label(sframe, text="(dBm)").grid(row=0, column=5, sticky="w", padx=(0, 6))
-        # Pmin 含义说明：空=最小功率(MINPower)；填值=Closed Loop 功率
-        self.pmin_hint = ttk.Label(sframe,
-            text="空=MINPower | 填值=闭环功率 (-50~23 dBm)",
-            foreground="#4a9eda")
-        self.pmin_hint.grid(row=0, column=6, sticky="w", padx=(0, 4))
+        # Pmin 含义说明改为鼠标悬停提示，避免占用左右显示空间
+        # 空=最小功率(MINPower)；填值=Closed Loop 功率(-50~23 dBm)
+        _attach_tip(self.sens_low_power_entry,
+                    "Pmin 小功率档（单位 dBm，范围 -50~23）\n"
+                    "留空：使用仪表 MINPower（最小发射功率）\n"
+                    "填值：下发给 CONF:LTE:SIGN:UL:TPC:CLTPower（闭环功率）\n"
+                    "仅在测试场景选 Pmin 或 Pmax+Pmin 时生效。")
 
         # ② TX 指标（按测试场景的功率档测上行）—— 勾选哪些就测哪些
         bf_tx = ttk.LabelFrame(metrics_row, text="② TX 指标", padding=(8, 5))
@@ -5089,13 +7527,16 @@ class App(tk.Tk):
         rframe.pack(fill="x")
         # 全信道扫描放最前（灵敏度探底之前）
         self.full_scan_cb = ttk.Checkbutton(
-            rframe, text="全信道扫描", variable=self.full_scan_var)
+            rframe, text="全信道扫描", variable=self.full_scan_var,
+            command=self._on_full_scan_toggle)
         self.full_scan_cb.grid(row=0, column=0, sticky="w", padx=(2, 12), pady=3)
         _attach_full_scan_tip(self.full_scan_cb)
-        ttk.Checkbutton(rframe, text=METRIC_LABELS["sensitivity"],
-                        variable=self.metric_vars["sensitivity"],
-                        command=self._on_metrics_change).grid(
-            row=0, column=1, sticky="w", padx=(2, 16), pady=3)
+        self.sensitivity_cb = ttk.Checkbutton(
+            rframe, text=METRIC_LABELS["sensitivity"],
+            variable=self.metric_vars["sensitivity"],
+            command=self._on_metrics_change)
+        self.sensitivity_cb.grid(row=0, column=1, sticky="w", padx=(2, 16), pady=3)
+        _attach_sensitivity_tip(self.sensitivity_cb)
         # 外部衰减（旧版手动输入框已移除，改用 freq_loss_segments 按频段/信道
         # 自动插值补偿 EATT:OUTP/EATT:INP，见 retune_cell + else 快速路径）
 
@@ -5364,6 +7805,16 @@ class App(tk.Tk):
         self._refresh_band_bw_summary()
         self._set_status("已清空全部选择：取消 %d 个频段及全部带宽勾选" % n_bands)
 
+    def _on_full_scan_toggle(self):
+        """全信道扫描开关：测试点数口径跟着变，立刻重算顶部汇总。
+
+        不重算的话，勾上后仍显示「36 测试点」（3 信道口径），而实际会跑
+        几百上千个组合，用户会按错的耗时预估去安排时间。
+        """
+        self._refresh_band_bw_summary()
+        if self.full_scan_var.get():
+            self._set_status("全信道扫描已开启：测试点数按全部合法信道计算，耗时显著增加")
+
     def _refresh_band_bw_summary(self):
         bands = [b for b in ALL_BANDS if self.band_vars[b].get()]
         bb = {b: [w for w in BW_CHOICES
@@ -5373,11 +7824,15 @@ class App(tk.Tk):
             cb.configure(text="%s (%d/%d)" %
                          (band_label(b), len(bb[b]), len(band_supported_bws(b))))
         pairs = [(b, w) for b in bands for w in bb[b]]
-        points = sum(len(band_channels(b, w)) for b, w in pairs)
+        # 勾选「全信道扫描」时按全部合法 EARFCN 计数（与 build_combos 同口径），
+        # 不能一律按低/中/高 3 点算，否则界面显示的点数远小于实际要测的组合数
+        full = bool(self.full_scan_var.get()) if hasattr(self, "full_scan_var") else False
+        points = sum(band_points_count(b, w, full) for b, w in pairs)
         detail = band_bws_summary(bands, bb, sep="；", limit=4)
         self.band_bw_summary_var.set(
-            "已选 %d 频段 / %d 组合 / %d 测试点   ｜   %s" %
-            (len(bands), len(pairs), points, detail))
+            "已选 %d 频段 / %d 组合 / %d 测试点%s   ｜   %s" %
+            (len(bands), len(pairs), points,
+             "（全信道）" if full else "", detail))
         # 表头总控状态同步：全勾=True / 部分或全空=False；无可作用频段则置灰
         for w in BW_CHOICES:
             tgt = self._head_bw_targets(w)
@@ -5386,6 +7841,409 @@ class App(tk.Tk):
             cb = (getattr(self, "head_bw_cbs", None) or {}).get(w)
             if cb is not None:
                 cb.configure(state=("normal" if tgt else "disabled"))
+
+    def _rx_path_ui_values(self):
+        """由当前配置的端口表生成三种模式的下拉显示串。"""
+        cfg = self.cfg_loaded or {}
+        return [rx_path_display(m, cfg) for m in RX_PATH_MODES]
+
+    def _refresh_rx_path_ui(self):
+        """配置里改了 RF 口后刷新下拉选项与显示（保持当前选中模式）。"""
+        cur_mode = rx_path_from_ui(self.rx_path_var.get())
+        values = self._rx_path_ui_values()
+        # RF 口组合下拉：选到两套预设之一就显示组合名，否则显示「自定义」
+        if hasattr(self, "rf_combo_cb"):
+            combo = combo_of_cfg(self.cfg_loaded) or RF_PORT_COMBO_CUSTOM
+            if str(self.rf_combo_var.get()) != combo:
+                self.rf_combo_var.set(combo)
+        if not hasattr(self, "rx_path_cb"):
+            return False
+        self.rx_path_cb.configure(values=values)
+        # 模式串已不含端口，宽度按三种模式名实测即可（端口在【RF口】下拉里看）
+        self.rx_path_cb.configure(width=_fit_combo_width(self.rx_path_cb, values,
+                                                        min_width=14))
+        new_display = values[RX_PATH_MODES.index(cur_mode)]
+        if self.rx_path_var.get() != new_display:
+            self.rx_path_var.set(new_display)
+        return True
+
+    def _save_rf_combo_only(self, name):
+        """只把 RF 口组合写回 config.json（组合名 + 展开后的端口表），其余键不动。"""
+        try:
+            data = {}
+            if os.path.isfile(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            ports = normalize_rx_path_ports(rf_ports_from_combo(name))
+            data["rf_port_combo"] = name
+            data["rx_path_ports"] = {
+                m: {"scenario": p["scenario"], "rx": list(p["rx"]),
+                    "tx": [list(t) for t in p["tx"]]}
+                for m, p in ports.items()}
+            save_config(data)
+            try:
+                self._cfg_mtime = os.path.getmtime(CONFIG_PATH)
+            except OSError:
+                pass
+        except Exception:
+            pass
+
+    def _on_rf_combo_change(self, _event=None):
+        """RF 口组合下拉：换一组口 → 三种模式端口表自动展开并落盘。"""
+        name = str(self.rf_combo_var.get()).strip()
+        ports = rf_ports_from_combo(name)
+        if not ports:
+            # 「自定义」：端口由 config 的 rx_path_ports 决定，这里不改动
+            self._set_status("RF 口为自定义接法，请在参数配置里改 rx_path_ports")
+            self.log("[RF口] 当前为自定义接法，端口未改动"
+                     "（改 config.json 的 rf_port_combo 或 rx_path_ports）")
+            return
+        self.cfg_loaded = dict(self.cfg_loaded or {})
+        self.cfg_loaded["rf_port_combo"] = name
+        self.cfg_loaded["rx_path_ports"] = normalize_rx_path_ports(ports)
+        self._refresh_rx_path_ui()
+        self._save_rf_combo_only(name)
+        self.log("[RF口] 组合切换为 %s：%s" % (name, RF_PORT_COMBOS[name]["desc"]))
+        for row in rf_path_rows(self.cfg_loaded):
+            self.log("[RF口] %s %s | 下行 %s | 上行 %s"
+                     % (row["mode"], row["scenario"], row["down"], row["up"]))
+        self._set_status("RF 口 → %s（%s），三种模式路由已自动展开"
+                         % (name, RF_PORT_COMBOS[name]["desc"]))
+
+    def _maybe_reload_config(self):
+        """轮询检查 config.json 是否在外部被修改，测量中不刷新。
+
+        由 _poll_queue 每 80ms 调用；mtime 变化才读盘，避免无谓 IO。
+        界面上的连接参数（接口/板号/地址/端口）与 RF 口都由 config.json 驱动，
+        直接编辑文件即可生效；正在输入的控件（有焦点）不覆盖，避免打断输入。
+        """
+        if self.busy:
+            return
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH) if os.path.isfile(CONFIG_PATH) else 0
+        except OSError:
+            return
+        if getattr(self, "_cfg_mtime", None) is None:
+            self._cfg_mtime = mtime
+            return
+        if mtime == self._cfg_mtime:
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # rf_port_combo 优先（两行展开），留空才用 rx_path_ports 手写端口
+            new_ports = normalize_rx_path_ports(
+                rf_ports_from_combo(data.get("rf_port_combo"))
+                or data.get("rx_path_ports"))
+        except Exception:
+            # 文件可能正在被编辑器写入：不更新 mtime，下轮继续重试
+            self.log("[配置] config.json 暂不可读，稍后重试")
+            return
+        self._cfg_mtime = mtime
+        self._apply_link_cfg(data)
+        old_ports = normalize_rx_path_ports(
+            (self.cfg_loaded or {}).get("rx_path_ports"))
+        if new_ports == old_ports:
+            return
+        self.cfg_loaded["rx_path_ports"] = new_ports
+        self.cfg_loaded["rf_port_combo"] = combo_of_ports(new_ports) or ""
+        self.cfg_loaded["rx_path"] = norm_rx_path(
+            rx_path_from_ui(data.get("rx_path", self.cfg_loaded.get("rx_path", "prx"))))
+        _rf, _rx = rx_path_ports(self.cfg_loaded["rx_path"], self.cfg_loaded)
+        self.cfg_loaded["rf"], self.cfg_loaded["rx"] = _rf, _rx
+        self._refresh_rx_path_ui()
+        self._set_status("已同步 RF 口配置：" + rx_path_desc(
+            self.cfg_loaded["rx_path"], self.cfg_loaded))
+        self.log("[配置] 检测到参数配置变更，RF 口/下拉已自动刷新")
+
+    def _apply_link_cfg(self, data):
+        """把 config.json 的接口/板号/地址/端口同步到界面（外部改文件即时生效）。"""
+        notes = []
+        for which, pre, label in (("cmw", "cmw", "终测仪"), ("psu", "psu", "电源")):
+            mode_var = self.cmw_iface_var if which == "cmw" else self.psu_iface_var
+            board_var = self.cmw_board_var if which == "cmw" else self.psu_board_var
+            addr_var = self.ip_var if which == "cmw" else self.psu_host_var
+            port_var = self.port_var if which == "cmw" else self.psu_port_var
+            entry = (self.cmw_addr_entry if which == "cmw" else self.psu_addr_entry)
+            raw = data.get(pre + "_ip")
+            gp_raw = data.get(pre + "_gpib_addr")
+            if raw is None and gp_raw is None:
+                continue
+            if raw is None:
+                raw = ""
+            mode = str(data.get(pre + "_link") or "").strip().upper()
+            if mode not in LINK_MODES:
+                mode = link_mode_from_address(raw)
+            board = gpib_board_of(data.get(pre + "_gpib_board",
+                                           board_var.get().replace("GPIB", "")))
+            if mode == "GPIB":
+                # GPIB 地址优先取 *_gpib_addr（新字段）；为空才回退旧版写在 *_ip 的值
+                src = gp_raw if str(gp_raw or "").strip() else raw
+                addr, board = split_gpib_cfg(src, board)
+                board_label = gpib_board_label(board)
+            else:
+                addr, board_label = clean_address(raw), None
+            if str(mode_var.get()).strip().upper() != mode:
+                mode_var.set(mode)
+                notes.append("%s 接口→%s" % (label, mode))
+            if board_label and str(board_var.get()).strip().upper() != board_label.upper():
+                board_var.set(board_label)
+                notes.append("%s 板号→%s" % (label, board_label))
+            # 正在输入的框不覆盖，避免打断用户
+            try:
+                focused = entry.focus_get() is entry
+            except Exception:
+                focused = False
+            if not focused and str(addr_var.get()).strip() != addr:
+                addr_var.set(addr)
+                notes.append("%s 地址→%s" % (label, addr or "(空)"))
+            port = str(data.get(pre + "_port") or "").strip()
+            if port and port_var.get().strip() != port:
+                port_var.set(port)
+                notes.append("%s 端口→%s" % (label, port))
+            self._apply_link_mode(which)
+            # 两个地址槽同步：LAN 槽取 *_ip，GPIB 槽取 *_gpib_addr（旧版写在 *_ip 的资源串也认）
+            lan, gpib = self._addr_slots(which)
+            f_gp = str(data.get(pre + "_gpib_addr") or "").strip()
+            if f_gp:
+                gpib = gpib_primary_only(f_gp)
+            f_lan = str(data.get(pre + "_ip") or "").strip()
+            if f_lan and link_mode_from_address(f_lan) != "GPIB":
+                f_lan = clean_address(f_lan)
+                if not focused:
+                    lan = f_lan
+            mem = self._addr_mem(which)
+            mem["LAN"], mem["GPIB"] = lan, gpib
+            self.cfg_loaded[pre + "_ip"] = lan
+            self.cfg_loaded[pre + "_gpib_addr"] = gpib
+            self.cfg_loaded[pre + "_link"] = mode
+            self.cfg_loaded[pre + "_gpib_board"] = gpib_board_of(board_var.get())
+            self.cfg_loaded[pre + "_port"] = port_var.get().strip()
+        if notes:
+            self._set_status("已同步 config.json：" + "、".join(notes[:3]))
+            self.log("[配置] 检测到 config.json 变更：" + "；".join(notes))
+
+    def _on_rx_path_change(self, *_event):
+        """兼容旧调用：端口映射由配置驱动，切换下拉无需额外动作。"""
+        return
+
+    # ---------------- 接口下拉（LAN / GPIB） ----------------
+    def _board_label(self, which):
+        var = self.cmw_board_var if which == "cmw" else self.psu_board_var
+        return str(var.get()).strip() or "GPIB0"
+
+    def _port_value(self, which):
+        return (self.port_var.get().strip() if which == "cmw"
+                else self.psu_port_var.get().strip()) or "5025"
+
+    def _addr_hint(self, which):
+        """地址框内的灰色示例文字（随接口切换，空值时才显示）。"""
+        gpib = str(self.cmw_iface_var.get() if which == "cmw"
+                   else self.psu_iface_var.get()).strip().upper() == "GPIB"
+        return "如 20（主地址）" if gpib else "如 192.168.1.100"
+
+    def _addr_mem(self, which):
+        """取（或初始化）某设备的地址记忆槽：LAN / GPIB 两个槽互不覆盖。"""
+        store = getattr(self, "_addr_mem_store", None)
+        if not isinstance(store, dict):
+            store = self._addr_mem_store = {}
+        if which not in store:
+            c = self.cfg_loaded or {}
+            gp = gpib_addr_mem(c, which,
+                               CONFIG_DEFAULTS.get(which + "_gpib_addr", ""))
+            lan = str(c.get(which + "_ip") or "").strip()
+            if lan and link_mode_from_address(lan) == "GPIB":
+                lan = ""       # *_ip 里存的是 GPIB 串/数字：不算 LAN 地址
+            store[which] = {"LAN": lan, "GPIB": gp}
+        return store[which]
+
+    def _addr_slots(self, which):
+        """按当前接口把地址框归到两个槽，返回 (LAN 地址, GPIB 主地址) 供落盘。"""
+        var = self.ip_var if which == "cmw" else self.psu_host_var
+        mode = str(self.cmw_iface_var.get() if which == "cmw"
+                   else self.psu_iface_var.get()).strip().upper()
+        mem = dict(self._addr_mem(which))
+        cur = clean_address(var.get())
+        if cur:
+            if mode == "GPIB":
+                mem["GPIB"] = gpib_primary_only(cur)
+            else:
+                mem["LAN"] = cur
+        return (str(mem.get("LAN") or "").strip(),
+                str(mem.get("GPIB") or "").strip())
+
+    def _on_link_mode_change(self, which):
+        """接口下拉切换：记住原接口的地址，再回填新接口上次用过的地址。
+
+        LAN ↔ GPIB 各记一份（config 的 *_ip / *_gpib_addr），切来切去不用重敲 20。
+        """
+        mode_var = self.cmw_iface_var if which == "cmw" else self.psu_iface_var
+        addr_var = self.ip_var if which == "cmw" else self.psu_host_var
+        label = "终测仪" if which == "cmw" else "电源"
+        gpib = str(mode_var.get()).strip().upper() == "GPIB"
+        target, src = ("GPIB", "LAN") if gpib else ("LAN", "GPIB")
+        mem = self._addr_mem(which)
+        cur = clean_address(addr_var.get())
+        if cur:
+            # 先按原接口口径存档：GPIB 槽只留主地址数字，IP 不混进来
+            mem[src] = gpib_primary_only(cur) if src == "GPIB" else cur
+        restore = str(mem.get(target) or "").strip()
+        if clean_address(addr_var.get()) != restore:
+            addr_var.set(restore)
+        if restore:
+            self.log("[接口] %s → %s：已回填上次用的地址 %s"
+                     "（默认值见 config.json 的 %s_gpib_addr / %s_ip）"
+                     % (label, target, restore, which, which))
+        self._apply_link_mode(which, log=True)
+
+    def _apply_link_mode(self, which, log=False):
+        """接口切换后统一刷新：板号可用性、地址框校验与提示、地址标签文案。"""
+        if which == "cmw":
+            mode_var, board_cb = self.cmw_iface_var, self.cmw_board_cb
+            entry, lbl_var, hint = (self.cmw_addr_entry, self.cmw_addr_lbl_var,
+                                    self._cmw_hint)
+            label, on = "终测仪", True
+        else:
+            mode_var, board_cb = self.psu_iface_var, self.psu_board_cb
+            entry, lbl_var, hint = (self.psu_addr_entry, self.psu_addr_lbl_var,
+                                    self._psu_hint)
+            label = "电源"
+            on = bool(self.psu_enable_var.get())   # 程控未勾选：整行由外部统一置灰
+        gpib = str(mode_var.get()).strip().upper() == "GPIB"
+        try:
+            board_cb.configure(state="readonly" if (gpib and on) else "disabled")
+        except Exception:
+            pass
+        try:
+            if not on:
+                entry.configure(state="disabled", validate="none")
+            elif gpib:
+                # GPIB 只允许输入数字（主地址 0~30）：从源头消灭 GPIB0::20::INSTR 拼错
+                entry.configure(state="normal", validate="key",
+                                validatecommand=self._gpib_vcmd)
+            else:
+                entry.configure(state="normal", validate="none")
+        except Exception:
+            pass
+        lbl_var.set("GPIB 地址:" if gpib else "IP 地址:")
+        try:
+            hint()
+        except Exception:
+            pass
+        if log:
+            if gpib:
+                self.log("[接口] %s → GPIB：地址只填主地址数字（0~%d，CMW500 出厂 20），"
+                         "板号选 %s；GPIB 不占用 IP/端口"
+                         % (label, GPIB_PRIMARY_MAX, self._board_label(which)))
+            else:
+                self.log("[接口] %s → LAN：地址填 IP（如 192.168.1.100），"
+                         "端口固定 %s（可在 config.json 的 *_port 修改）"
+                         % (label, self._port_value(which)))
+
+    def _sync_board(self, which, board):
+        """把实际使用的板号写回下拉（地址里显式写了板号时用）。"""
+        var = self.cmw_board_var if which == "cmw" else self.psu_board_var
+        label = gpib_board_label(board)
+        if str(var.get()).strip().upper() != label.upper():
+            var.set(label)
+            self._apply_link_mode(which)
+
+    def _sync_iface(self, which, mode):
+        """把自动判定出的接口写回下拉框，并同步板号/地址框状态。
+
+        自动切换（如 LAN 模式下误填 20 → 自动转 GPIB）时：
+        ① 先把框里的地址存进原接口的槽；
+        ② 若框里的地址形态和新接口不匹配（IP 放在 GPIB 里 / 数字放在 LAN 里），
+           回填新接口上次用过的地址，保证框里显示的永远是当前接口能用的值。
+        """
+        var = self.cmw_iface_var if which == "cmw" else self.psu_iface_var
+        addr_var = self.ip_var if which == "cmw" else self.psu_host_var
+        old = str(var.get()).strip().upper()
+        if old != mode:
+            cur = clean_address(addr_var.get())
+            if cur:
+                mem = self._addr_mem(which)
+                slot = old if old in ("LAN", "GPIB") else "LAN"
+                mem[slot] = gpib_primary_only(cur) if slot == "GPIB" else cur
+                # 当前地址是否还能用于新接口：GPIB 认纯数字，LAN 认 IP/主机名
+                keep = (bool(re.fullmatch(r"\d{1,2}", cur))
+                        if mode == "GPIB" else look_like_host(cur))
+                if not keep:
+                    restore = str(self._addr_mem(which).get(mode) or "").strip()
+                    if clean_address(addr_var.get()) != restore:
+                        addr_var.set(restore)
+            var.set(mode)
+        self._apply_link_mode(which)
+
+    def _resolve_link(self, device, mode, addr, board=0):
+        """按【接口】下拉校验地址：GPIB 只认主地址数字，其余尽量按内容纠正。
+
+        返回 (实际接口, 归一后的地址, 板号)。
+        """
+        a = clean_address(addr)
+        mode = str(mode or "").strip().upper()
+        board = gpib_board_of(board)
+        if not a:
+            raise LinkError("请填写%s地址：LAN 填 IP（如 192.168.1.100），"
+                            "GPIB 只填主地址数字（如 20）" % device)
+        if mode == "GPIB":
+            parsed = parse_gpib_addr(a)
+            if parsed:
+                addr_board, primary = parsed
+                if not gpib_primary_ok(primary):
+                    raise LinkError("%s 的 GPIB 主地址 %s 超出范围（0~%d）。"
+                                    % (device, primary, GPIB_PRIMARY_MAX))
+                if addr_board is not None and addr_board != board:
+                    self.log("[接口] %s 地址里写了板号 GPIB%d，已改用该板号" %
+                             (device, addr_board))
+                    board = addr_board
+                return "GPIB", build_gpib_resource(board, primary), board
+            if _IPV4_RE.match(a):
+                # 明显是 IPv4（粘贴了 LAN 地址）：按内容为准，自动切回 LAN
+                self.log("[接口] %s 地址 %s 是 IP，与所选的 GPIB 不符，"
+                         "已自动切到 LAN" % (device, a))
+                return "LAN", a, board
+            raise LinkError("%s 地址 \"%s\" 不是 GPIB 主地址。\n"
+                            "• GPIB：只填一个数字（0~%d，如 CMW500 出厂 20）\n"
+                            "• 走网线：把【接口】切到 LAN 后填 IP（如 192.168.1.100）\n"
+                            "• 板号在【板号】下拉里选，不用写进地址"
+                            % (device, a, GPIB_PRIMARY_MAX))
+        if is_visa_address(a) or re.fullmatch(r"\d{1,3}", a):
+            parsed = parse_gpib_addr(a)
+            primary = parsed[1] if parsed else a
+            if parsed and parsed[0] is not None:
+                board = parsed[0]
+            self.log("[接口] %s 地址 %s 只有数字/GPIB 串（不可能是 IP），"
+                     "按 GPIB 处理：%s" % (device, a,
+                                          build_gpib_resource(board, primary)))
+            return "GPIB", build_gpib_resource(board, primary), board
+        return "LAN", a, board
+
+    def _on_psu_enable_change(self):
+        """程控复选框：未勾选时电源设置控件置灰，并刷新连接标签。"""
+        on = bool(self.psu_enable_var.get())
+        state = "normal" if on else "disabled"
+        # 电源行的 Entry/Combobox 无单独引用，遍历 f2 直接子控件置灰。
+        # 注意：Combobox 恢复时必须回到 "readonly"（不是 "normal"），否则电源型号/
+        # 通道会变成可手输，且 readonly 与 normal 的底色不同（clam 下灰 vs 白）。
+        f2 = getattr(self, "psu_frame", None)
+        if f2 is not None:
+            for w in f2.winfo_children():
+                if isinstance(w, ttk.Combobox):
+                    try:
+                        w.configure(state=("readonly" if on else "disabled"))
+                    except Exception:
+                        pass
+                elif isinstance(w, ttk.Entry):
+                    try:
+                        w.configure(state=state)
+                    except Exception:
+                        pass
+        if not on and getattr(self, "psu_label", None) is not None:
+            self.psu_label.config(text="○ 未程控", foreground="#888888")
+        if on:
+            # 重新启用后仍要按接口下拉决定端口框：GPIB 下端口不参与
+            self._apply_link_mode("psu")
 
     def _on_sens_mode_change(self):
         """功率工况切换：仅 low/both 时小功率输入框可用；同步刷新结果表首行。"""
@@ -5413,7 +8271,7 @@ class App(tk.Tk):
                 "metrics": {k: bool(v.get()) for k, v in self.metric_vars.items()},
                 "power_scenario": self.sens_power_mode_var.get().strip(),
                 "sens_power_mode": self.sens_power_mode_var.get().strip(),
-                "psu_enable": True,   # 界面无电源勾选框，固定启用
+                "psu_enable": bool(self.psu_enable_var.get()),  # 程控复选框
             }
             self._rebuild_result_columns(cfg)
         except Exception:
@@ -5433,90 +8291,38 @@ class App(tk.Tk):
     AT_PROBE_HINTS = ("modem", "asr", "at ", "at-", "serial")  # 描述关键词 → 优先探测
 
     def _detect_at_ports(self, manual=False):
-        """枚举 COM 口并逐个做 AT 握手，找出 AT 口；后台线程，结果经队列回 GUI。
+        """枚举 COM 口并回填下拉框；默认选 modem device（排除 device2）。
 
-        manual=True 时由【检测】按钮触发；启动时静默跑一次（manual=False）。
+        manual=True 由【检测】按钮触发（写日志）；启动时静默跑一次。
+        纯枚举、不开串口：modem device 与 device2 通常都能响应 AT，握手无法
+        区分哪个是目标口；按描述判定更可靠，也避免占用端口与逐口超时等待。
         """
         if serial is None:
             self.log("[AT] 缺少 pyserial 模块，AT 控制不可用（pip install pyserial）")
             return
-        if not self._at_lock.acquire(blocking=False):
-            self.log("[AT] 检测跳过：已有 AT 操作（探测/发送）进行中")
-            return
 
         def worker():
-            names = []
-            found = ""
+            names, suggest = [], ""
             try:
-                ports = list(serial.tools.list_ports.comports())
+                ports = [(p.device, (p.description or "").strip())
+                         for p in serial.tools.list_ports.comports()]
+                names = [dev for dev, _ in ports]
                 if not ports:
-                    self.log("[AT] 未发现任何 COM 口（请检查 DUT USB 是否插好）")
-                    return
-                # 描述含 modem/asr 等关键词的排前面，探测更快命中
-                def prio(p):
-                    desc = (p.description or "").lower()
-                    return (0 if any(k in desc for k in self.AT_PROBE_HINTS) else 1,
-                            p.device)
-
-                def probe_one(device):
-                    """单端口 AT 握手；子线程跑、join(6s) 看门狗，卡死则跳过。"""
-                    res = {}
-                    def run():
-                        ser = None
-                        try:
-                            ser = serial.Serial(device, self.AT_BAUD, timeout=0.8)
-                        except Exception as e:
-                            res["err"] = str(e)
-                            return
-                        try:
-                            ser.reset_input_buffer()
-                            ser.write(b"AT\r\n")
-                            t0 = time.time()
-                            got = ""
-                            while time.time() - t0 < 2.0:
-                                data = ser.readline()
-                                if not data:
-                                    continue
-                                got += data.decode(errors="replace")
-                                if "OK" in got or "ERROR" in got:
-                                    break
-                            res["ok"] = "OK" in got
-                        except Exception:
-                            res["err"] = "io"
-                        finally:
-                            try:
-                                ser.close()
-                            except Exception:
-                                pass
-                    t = threading.Thread(target=run, daemon=True)
-                    t.start()
-                    t.join(6.0)
-                    if t.is_alive():
-                        self.log("[AT] %s 探测超时（口被占用或模组卡死），跳过" % device)
-                    elif "err" in res:
-                        self.log("[AT] %s 打不开（被其它串口工具占用？）： %s"
-                                 % (device, res["err"].splitlines()[0] if res["err"] else ""))
-                    return bool(res.get("ok"))
-
-                for p in sorted(ports, key=prio):
-                    names.append(p.device)
-                    if found:
-                        continue   # 已找到 AT 口，其余端口只列出不再探测
-                    try:
-                        if probe_one(p.device):
-                            found = p.device
-                            self.log("[AT] %s 是 AT 口（%s），已选中"
-                                     % (p.device, (p.description or "").strip()))
-                    except Exception:
-                        pass
-                if not found:
-                    self.log("[AT] 未探测到响应 AT 的串口（非 AT 口通常无响应；"
-                             "若模组刚被 CFUN=0 卡死，请给 DUT 断电重启后再试）")
+                    if manual:
+                        self.log("[AT] 未发现任何 COM 口（请检查 DUT USB 是否插好）")
+                else:
+                    suggest = pick_at_port(ports)
+                    if manual:
+                        for dev, desc in ports:
+                            self.log("[AT] 发现 %s  %s" % (dev, desc or "（无描述）"))
+                        self.log("[AT] 默认选 %s（modem device 优先，排除 device2）"
+                                 % suggest)
             except Exception as e:
-                self.log("[AT] 端口检测异常: %s" % type(e).__name__)
+                self.log("[AT] 端口枚举异常: %s" % type(e).__name__)
             finally:
-                self._at_lock.release()
-                self.msg_queue.put(("at_ports", (names, found)))
+                # 带上 manual：手动点【检测】要切到推荐口，启动静默枚举保留上次选择
+                self.msg_queue.put(("at_ports", (names, suggest, manual)))
+
         threading.Thread(target=worker, daemon=True).start()
 
     def _send_at_cmd(self):
@@ -5538,11 +8344,11 @@ class App(tk.Tk):
             return
         port = self.at_port_var.get().strip()
         if not port or port.lower() == "auto":
+            # 空值（或旧配置残留 auto）时回退到探测缓存；正常应手动选口
             port = getattr(self, "_at_port_detected", "")
             if not port:
-                self.log("[AT] 未确定 AT 口：请先点【检测】，或在 AT口 框手动填 COMx")
+                self.log("[AT] 未选择 AT 口：请在 AT口 下拉中选 COMx，或点【检测】刷新列表")
                 return
-            self.at_port_var.set(port)
         self._at_busy = True
         self.btn_at_send.config(state="disabled")
         if len(cmds) > 1:
@@ -5553,7 +8359,7 @@ class App(tk.Tk):
         """在同一串口会话内依次下发多条指令；每条读到 OK/ERROR 或 8s 超时。
 
         - 单条失败（异常/超时）不中断后续指令；
-        - 全程持 _at_lock（与探测互斥）；打开失败自动重试 3 次；
+        - 全程持 _at_lock（防重入）；打开失败自动重试 3 次；
         - 外层 join(15s×条数) 看门狗：串口/模组卡死时释放按钮，
           残留阻塞线程为 daemon，随进程退出；
         - 结束后经队列在主线程保存输入框内容（at_cmd 持久化）。
@@ -5688,14 +8494,32 @@ class App(tk.Tk):
 
     def _read_cfg(self):
         cfg = dict(CONFIG_DEFAULTS)
+        _rx_mode = rx_path_from_ui(self.rx_path_var.get())
+        # 结构化 RF 口来自已加载/自动刷新的配置，保存设置时必须一并写回
+        cfg["rx_path_ports"] = normalize_rx_path_ports(
+            (self.cfg_loaded or {}).get("rx_path_ports"))
+        _rf, _rx = rx_path_ports(_rx_mode, cfg)
+        # 地址记忆：LAN / GPIB 各存一份，接口来回切换都不丢（GPIB 只存主地址数字）
+        _cmw_lan, _cmw_gp = self._addr_slots("cmw")
+        _psu_lan, _psu_gp = self._addr_slots("psu")
         cfg.update({
-            "cmw_ip": self.ip_var.get().strip(),
+            "instrument": self.instrument_var.get().strip(),
+            "psu_model": self.psu_model_var.get().strip(),
+            "cmw_ip": _cmw_lan,
+            "cmw_gpib_addr": _cmw_gp,
             "cmw_port": self.port_var.get().strip(),
-            "rf": self.rf_var.get().strip(),
-            "rx": self.rx_var.get().strip(),
-            "psu_enable": True,   # 电源默认启用，界面无勾选框
-            "psu_ip": self.psu_host_var.get().strip(),
+            # 接口下拉（LAN/GPIB）：保存后下次启动按此恢复，不必再从地址猜
+            "cmw_link": self.cmw_iface_var.get().strip().upper(),
+            # GPIB 板号单独存：地址框只保存主地址数字（如 20）
+            "cmw_gpib_board": gpib_board_of(self.cmw_board_var.get()),
+            # RF口/RX 按接收模式派生（界面已无独立下拉）
+            "rx_path": _rx_mode, "rf": _rf, "rx": _rx,
+            "psu_enable": bool(self.psu_enable_var.get()),  # 程控复选框控制
+            "psu_ip": _psu_lan,
+            "psu_gpib_addr": _psu_gp,
             "psu_port": self.psu_port_var.get().strip(),
+            "psu_link": self.psu_iface_var.get().strip().upper(),
+            "psu_gpib_board": gpib_board_of(self.psu_board_var.get()),
             "psu_channel": self.psu_channel_var.get().strip().upper(),
             "psu_voltage": self.psu_voltage_var.get().strip(),
             "psu_readv": True,   # 电压/电流默认记录，无勾选框
@@ -5808,8 +8632,11 @@ class App(tk.Tk):
         if eatt < 0 or eatt > 80:
             raise ValueError("外部衰减值需在 0 ~ 80 dB 之间")
         if cfg["psu_enable"]:
-            if not cfg["psu_ip"]:
-                raise ValueError("请填写电源 IP（电源默认启用）")
+            if not link_addr(cfg, "psu"):
+                raise ValueError("请填写电源地址（%s，电源默认启用）"
+                                 % ("GPIB 主地址数字，如 5"
+                                    if str(cfg.get("psu_link")).upper() == "GPIB"
+                                    else "LAN 的 IP，如 192.168.1.200"))
             if cfg["psu_channel"] not in PSU_CHANNELS:
                 raise ValueError("电源通道只能是 P6V/P25V/N25V")
             if cfg["psu_voltage"]:
@@ -5825,40 +8652,90 @@ class App(tk.Tk):
         try:
             cfg = self._read_cfg()
         except Exception:
+            # 业务校验失败（如未勾频段）时仍要保留 AT 口等界面选择，避免整体回退丢失
             cfg = dict(self.cfg_loaded)
+            cfg["at_port"] = self.at_port_var.get().strip()
         if save_config(cfg):
             self.cfg_loaded = cfg
 
+    def _save_at_port_only(self):
+        """只把 AT 口写回 config.json，绕过其它业务校验。
+
+        用户选完口径就落盘，不能等到关闭时——关闭时若频段/电源等校验不过，
+        整份配置会回退，AT 口选择就丢了。
+        """
+        try:
+            data = {}
+            if os.path.isfile(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            port = self.at_port_var.get().strip()
+            if data.get("at_port") == port:
+                return
+            data["at_port"] = port
+            save_config(data)
+            if isinstance(getattr(self, "cfg_loaded", None), dict):
+                self.cfg_loaded["at_port"] = port
+        except Exception:
+            pass
+
     # ---------------- 连接 ----------------
     def _connect_scpi(self):
-        host = self.ip_var.get().strip()
-        if not host:
-            raise ValueError("请填写 CMW500 的 IP 地址")
-        port = int(self.port_var.get().strip() or 5025)
+        raw = self.ip_var.get()
+        addr = clean_address(raw)
+        if not addr:
+            raise LinkError("请填写 CMW500 地址：LAN 填 IP（如 192.168.1.100），"
+                            "GPIB 填 GPIB0::20::INSTR（也可只填地址号 20）")
+        mode, addr, board = self._resolve_link(
+            "CMW500", self.cmw_iface_var.get(), addr, self.cmw_board_var.get())
+        if mode == "GPIB":
+            self._sync_board("cmw", board)
+        self._sync_iface("cmw", mode)
+        if raw.strip() != addr:
+            self.log("[连接] 地址已自动规整：%r → %r" % (raw.strip(), addr))
+        port = self.port_var.get().strip() or "5025"
         eol = "\n"  # CMW500 及绝大多数现代 SCPI 仪器默认 LF，无需 CRLF 可配置
-        scpi = ScpiTransport(host, port, timeout=10.0, eol=eol)
+        scpi, desc = open_scpi(addr, port, timeout=10.0, eol=eol)
+        if isinstance(scpi, VisaTransport):
+            self.log("[连接] %s 走 VISA，端口框（%s）不参与" % (desc, port))
+        elif desc.rsplit(":", 1)[0] != addr:
+            # 地址框里连端口一起填了（10.1.2.3:5025），以地址框为准
+            self.log("[连接] 地址框内容按『主机 + 端口』解析，实际连接 %s" % desc)
         idn = scpi.connect()
         self.scpi = scpi
         self.conn_label.config(text="● 已连接", foreground="#2e7d32")
         self.idn_label.config(text=idn)
-        self.log("[连接] %s:%d %s" % (host, port, idn))
+        self.log("[连接] %s %s" % (desc, idn))
         return scpi
 
     def _connect_psu(self):
-        # 电源默认启用（界面无勾选框），总是连接
-        host = self.psu_host_var.get().strip()
-        if not host:
-            self.log("[电源连接] 跳过：未填写 IP")
+        # 程控复选框未勾选：完全跳过电源（不连接、不下发电压、不采功耗）
+        if not bool(self.psu_enable_var.get()):
+            self.log("[电源] 程控未勾选，跳过电源初始化与功耗采集")
+            if getattr(self, "psu_label", None) is not None:
+                self.psu_label.config(text="○ 未程控", foreground="#888888")
+            return None
+        addr = clean_address(self.psu_host_var.get())
+        if not addr:
+            self.log("[电源连接] 跳过：未填写 IP / GPIB 地址")
             self.psu_label.config(text="● 未连接（跳过）", foreground="#888")
             return None
-        port = int(self.psu_port_var.get().strip() or 5025)
-        psu = ScpiTransport(host, port, timeout=10.0)
+        mode, addr, board = self._resolve_link(
+            "电源", self.psu_iface_var.get(), addr, self.psu_board_var.get())
+        if mode == "GPIB":
+            self._sync_board("psu", board)
+        self._sync_iface("psu", mode)
+        port = self.psu_port_var.get().strip() or "5025"
+        psu, desc = open_scpi(addr, port, timeout=10.0)
+        if isinstance(psu, VisaTransport):
+            self.log("[电源连接] %s 走 VISA，端口框（%s）不参与" % (desc, port))
         try:
             idn = psu.connect()
             psu.write("SYST:REM")
         except Exception as e:
             psu.close()
-            self.log("[电源连接] ⚠️ 失败：%s:%d — %s" % (host, port, type(e).__name__))
+            self.log("[电源连接] ⚠️ 失败：%s — %s" % (
+                desc, str(e) if isinstance(e, ScpiError) else type(e).__name__))
             self.log("[电源连接] 提示：电源功耗测量不可用，但射频指标（灵敏度/EVM/ACLR）不受影响")
             self.psu_label.config(text="⚠️ 连接失败（功耗跳过）", foreground="#e67e22")
             return None
@@ -5866,14 +8743,14 @@ class App(tk.Tk):
             # socket 建立但设备没回 IDN：真机 180539.log Run2 曾静默继续，
             # 之后 12 条功耗查询全空才提示"运行中断开"，误导排障方向。
             psu.close()
-            self.log("[电源连接] ⚠️ %s:%d 已连接但未返回 IDN（设备无响应/地址错误），"
-                     "功耗数据跳过" % (host, port))
-            self.log("[电源连接] 提示：请确认电源 IP 与网络可达；射频指标不受影响")
+            self.log("[电源连接] ⚠️ %s 已连接但未返回 IDN（设备无响应/地址错误），"
+                     "功耗数据跳过" % desc)
+            self.log("[电源连接] 提示：请确认电源地址与链路可达；射频指标不受影响")
             self.psu_label.config(text="⚠️ 无响应（功耗跳过）", foreground="#e67e22")
             return None
         self.psu = psu
         self.psu_label.config(text="● 已连接", foreground="#2e7d32")
-        self.log("[电源连接] %s:%d %s" % (host, port, idn))
+        self.log("[电源连接] %s %s" % (desc, idn))
         return psu
 
     def disconnect(self):
@@ -5892,6 +8769,10 @@ class App(tk.Tk):
         if self.busy:
             messagebox.showinfo("忙", "请等待当前操作结束。")
             return
+        # 非续测流程必须按第 1 个组合建网：清掉上次续测失败可能残留的起点，
+        # 否则初始化会用错频段/带宽建小区，首组合带着旧 RMC 测出全 INV
+        if not self._resume_pending:
+            self._resume_start_idx = 0
         try:
             cfg = self._read_cfg()
         except ValueError as exc:
@@ -5905,10 +8786,18 @@ class App(tk.Tk):
 
     def _init_worker(self, cfg):
         try:
-            # 初始化小区必须用第一个测试组合的频段/带宽：
-            # 现在每个频段带宽不同，用全局 bws[0] 可能与该频段不匹配。
-            first = (cfg.get("combos") or [("", "", "", -1)])[0]
+            # 初始化小区必须用第一个「待测」组合的频段/带宽：
+            # 正常从头测时就是 combos[0]；断点续测时是断点后的第一个组合，
+            # 否则小区按旧频段/带宽建网，首组合直接测会带旧 RMC → 全 INV。
+            _combos = cfg.get("combos") or [("", "", "", -1)]
+            _start = int(getattr(self, "_resume_start_idx", 0) or 0)
+            _start = max(0, min(_start, len(_combos) - 1))
+            first = _combos[_start]
             band, bw = first[0], first[1]
+            if _start:
+                self.log("[断点续测] 初始化按第 %d 个组合建网：%s / %s"
+                         % (_start + 1, band_label(band) if band else "默认",
+                            bw_label(bw) if bw else "默认"))
             # 记录小区实际建立的频段/带宽：测量循环用它判断"是否换带宽"，
             # 不能假定它等于开始测量时的首组合——用户可能在初始化后
             # 修改了带宽勾选（真机 180539.log：init 按 10MHz 建小区，
@@ -5947,11 +8836,22 @@ class App(tk.Tk):
                     self.log("[PSU] " + cmd)
 
             self.msg_queue.put(("init_done", "仪表初始化完成（小区 ON,ADJ，UE 已注册）"))
+        except LinkError as exc:
+            # 地址/接口填错属用户可自行修正的业务错误：只回消息文本。
+            # 之前它落进 except Exception 被整段 traceback 弹窗，用户只看到
+            # "line 6849, in _resolve_link" 这类无用信息（真机 18:44 GPIO0 那次）。
+            self.msg_queue.put(("error", "初始化失败：%s" % exc))
+        except ScpiError as exc:
+            # 连接/初始化类错误的消息本身就是给用户看的（地址写错、UE 未注册…），
+            # 只回消息文本，不甩堆栈——之前 getaddrinfo failed 的裸堆栈无法排障。
+            self.msg_queue.put(("error", "初始化失败：%s" % exc))
+        except (OSError, socket.timeout, socket.gaierror) as exc:
+            self.msg_queue.put(("error", "连接失败：%s" % exc))
         except Exception:
             self.msg_queue.put(("error", traceback.format_exc()))
 
     # ---------------- ② 开始测量 ----------------
-    def start_measurement(self):
+    def start_measurement(self, resume=None):
         if self.busy:
             messagebox.showinfo("忙", "上一次测量尚未结束。")
             return
@@ -5963,8 +8863,50 @@ class App(tk.Tk):
         except ValueError as exc:
             messagebox.showwarning("输入错误", str(exc))
             return
+        # 断点续测：手动点【开始测量】时若发现断点，先问一句要不要接着测；
+        # 自动续测（启动时倒计时）直接把断点当参数传进来，不再弹询问框。
+        if resume is None:
+            _st = read_checkpoint()
+            if _st:
+                resume = self._confirm_resume(_st, cfg)
+        # 续测以断点里的组合表为准（指纹已校验一致，顺序/长度与当前完全相同），
+        # 防止 specs 更新或界面微调导致组合表错位、把结果对上错误的信道
+        if resume is not None:
+            try:
+                cfg["combos"] = [tuple(c) for c in resume["combos"]]
+            except Exception:
+                resume = None
         self.save_settings()
+        # 本次运行的创建时间：续测沿用原断点的创建时间，报告里看得出跨了几次
+        self._run_created_at = ((resume or {}).get("created_at") or
+                                datetime.datetime.now().isoformat(timespec="seconds"))
+        self._ckpt_warned = False
+        # 续测：明细文件里已有 done 行，从这里接着追加；从头测则从 0 重建
+        self._ckpt_items_written = int((resume or {}).get("done") or 0)
+        # 同步保存限频状态重置：新的一轮第一个组合就落一份快照
+        self._snap_xlsx_ts = None
+        self._snap_warned_txt = False
+        self._snap_warned_xlsx = False
         _start_dt = datetime.datetime.now()   # 开始时间（用于报告末尾显示总耗时）
+        # 每轮测试独立日志：与即将导出的结果文件共用同一时间戳（一一匹配）
+        _base_stamp = _start_dt.strftime("%Y%m%d_%H%M%S")
+        _stamp = _base_stamp
+        _n = 1
+        while (os.path.exists(os.path.join(RESULT_DIR, "LTE_%s.xlsx" % _stamp)) or
+               os.path.exists(os.path.join(APP_DIR, "logs", "LTE_%s.log" % _stamp))):
+            _n += 1
+            _stamp = "%s_%02d" % (_base_stamp, _n)
+        self.run_stamp = _stamp
+        _log_path = os.path.join(APP_DIR, "logs", "LTE_%s.log" % _stamp)
+        try:
+            if self.run_log:
+                self.run_log.restart(_log_path)
+            else:
+                self.run_log = RunLogger(path=_log_path)
+            self.log("[日志] 本轮日志: %s" % self.run_log.path)
+        except Exception as exc:
+            self.run_log = None
+            print("本轮日志重建失败:", exc)
         self.busy = True
         self._set_busy(True)
         # 每次开始测量重置暂停状态并启用暂停按钮（测量结束时由 _poll_queue 禁用）
@@ -5974,8 +8916,20 @@ class App(tk.Tk):
         # 清空结果表：每测完一个组合就实时插入一行
         self._clear_result_rows()
         if self.run_log:
-            self.run_log.section("测试启动（组合数=%d）" % len(cfg["combos"]))
-            self.run_log.kv([("IP", cfg["cmw_ip"]), ("RF口", cfg["rf"]),
+            if resume:
+                self.run_log.section("断点续测：从第 %d/%d 个组合继续（已完成 %d 个）"
+                                     % (resume["done"] + 1, len(cfg["combos"]),
+                                        resume["done"]))
+                self.run_log.write("[断点] 上次断点时间 %s，本次运行创建时间 %s"
+                                   % (resume.get("updated_at") or "?",
+                                      self._run_created_at))
+            else:
+                self.run_log.section("测试启动（组合数=%d）" % len(cfg["combos"]))
+            self.run_log.kv([("仪表地址", link_desc(link_addr(cfg, "cmw"),
+                                                    cfg.get("cmw_port"))),
+                             ("接收模式", rx_path_label(cfg.get("rx_path"))),
+                             ("RF口组合", combo_of_cfg(cfg) or "自定义"),
+                             ("RF路径", rx_path_desc(cfg.get("rx_path"), cfg)),
                              ("频段", ",".join(band_label(b) for b in cfg["bands"])),
                              ("频段/各自带宽", band_bws_summary(
                                  cfg["bands"], cfg.get("band_bws") or {})),
@@ -5984,21 +8938,56 @@ class App(tk.Tk):
                               else "低/中/高三信道"),
                              ("电源启用", cfg["psu_enable"]),
                              ("指标", ",".join(k for k, v in cfg["metrics"].items() if v)),
-                             ("信道表", channel_table_source())])
+                             ("信道表", channel_table_source()),
+                             ("测速参数", "功率档稳定 %ss / BLER 轮询 %ss / 子帧 %s / "
+                                          "电源采样 %s" % (
+                                              cfg.get("tpc_settle", "2.5"),
+                                              cfg.get("sens_poll", "0.15"),
+                                              cfg.get("bler_subframes", "600"),
+                                              cfg.get("psu_read_mode", "tx_only")))])
+            # RF 路径映射表：每份日志自带三种模式的路由，换口后不用再翻日志反推
+            self.run_log.write("[RF口] 三种接收模式的连接器/转换器（FDC 校准口见括号）：")
+            for _r in rf_path_rows(cfg):
+                self.run_log.write("[RF口] %-7s %-6s 下行 %-32s 上行 %s"
+                                   % (_r["mode"], _r["scenario"], _r["down"], _r["up"]))
             skipped = cfg.get("skipped_combos") or []
             if skipped:
                 self.run_log.write("[跳过] 该频段不支持此带宽，已跳过: %s" % ", ".join(skipped))
-        threading.Thread(target=self._measure_worker, args=(cfg,), daemon=True).start()
+        # 续测：先把断点里已完成的行回填到结果表（表格与状态栏都从断点接着走）。
+        # 回填必须在新测量线程启动之前做完，否则新行会插到旧行前面、顺序错乱。
+        if resume:
+            self._restore_resume_rows(resume, cfg)
+        threading.Thread(target=self._measure_worker, args=(cfg, resume), daemon=True).start()
 
-    def _measure_worker(self, cfg):
+    def _measure_worker(self, cfg, resume=None):
+        start_idx = int((resume or {}).get("done") or 0)
         try:
             _start_dt = datetime.datetime.now()   # 整体计时（耗时统计）
             enabled = {k for k, v in cfg["metrics"].items() if v}
-            # 电流/电压/功率默认随电源记录，不再需要单独勾选 current
-            want_current = bool(cfg.get("psu_enable"))
+            # 电流/电压/功率默认随电源记录，不再需要单独勾选 current。
+            # 纯 RX（只勾 sensitivity）时电源电流与射频判定无关：实测 1581 组合
+            # 读了 2031 次 MEAS、占总耗时 0.6%，纯属刷屏 + 白跑电源口往返。
+            # 默认 tx_only = 只有带 TX 指标时才逐组合采样；纯 RX 只用开跑前那一次快照。
+            _has_tx = bool(enabled & {"maxpower", "aclr", "evm", "freqerr"})
+            _psu_read_mode = str(cfg.get("psu_read_mode") or "tx_only").strip().lower()
+            want_current = bool(cfg.get("psu_enable")) and (
+                _psu_read_mode == "always"
+                or (_psu_read_mode == "tx_only" and _has_tx))
             items = []
             # 同频段同带宽上一信道的灵敏度(RS EPRE)，供下一信道热点续扫
             sens_hotspots = {}
+            # 续测：继承断点里已完成的 items 与灵敏度热点缓存 —— items 让最终导出的
+            # 是一份完整报告；热点让续测首组合直接落在窗口内，省一次 warmup。
+            if resume:
+                items = list(resume.get("items") or [])
+                for _rec in (resume.get("hotspots") or []):
+                    try:
+                        _k, _v = _rec
+                        sens_hotspots[tuple(_k)] = float(_v)
+                    except Exception:
+                        continue
+                self.log("[断点续测] 继承已完成 %d 个组合、%d 条热点缓存，从第 %d 个组合开始"
+                         % (len(items), len(sens_hotspots), start_idx + 1))
             total = len(cfg["combos"])
             # 初始化仪表时已按某频段/带宽建立小区并注册 UE。以 init 实际建立的
             # (band,bw) 为起点（cell_actual）：同一频段+带宽内换信道走快速重同步
@@ -6015,6 +9004,9 @@ class App(tk.Tk):
             # Pmin 档功率未配置时只提醒一次（每个组合都提醒会刷屏）
             _pmin_hint_done = False
             for idx, combo in enumerate(cfg["combos"], 1):
+                # 续测：断点里已完成的组合直接跳过（不发 SCPI、不刷日志）
+                if idx <= start_idx:
+                    continue
                 band, bw, pos, earfcn = (list(combo) + ["", "", "默认", -1])[:4]
                 label = "%s / %s / %s(CH%s)" % (
                     band_label(band) if band else "默认频段",
@@ -6082,13 +9074,14 @@ class App(tk.Tk):
                     if earfcn is not None and int(earfcn) >= 0:
                         cmd = build_channel_cmd(cfg, earfcn)
                         scpi.write(cmd); self.log("[SCPI] " + cmd)
-                    # 动态 EATT：同频段换信道也要按新信道中心频率补偿外部线缆损耗
+                    # 损耗补偿：统一由 FDC 表按频点插值，这里只写日志核对，
+                    # 不再改写 EATT（否则与 FDC 叠加成 2× 补偿）
                     _mhz = earfcn_to_dl_center_mhz(band, earfcn)
                     _loss = lookup_loss_mhz(cfg, _mhz) if _mhz else None
-                    if _loss is not None:
-                        scpi.write("CONF:LTE:SIGN:RFS:EATT:OUTP %.1f" % _loss)
-                        scpi.write("CONF:LTE:SIGN:RFS:EATT:INP %.1f" % _loss)
-                        self.log("[EATT] DL=%.1f MHz → 外部线缆损耗 %.1f dB（OUTP/INP 均补偿）" % (_mhz, _loss))
+                    if _loss:
+                        self.log("[FDC] DL=%.1f MHz → 损耗 %s dB"
+                                 "（由 FDC 表补偿，EATT 不再叠加）"
+                                 % (_mhz, _fmt_db(_loss)))
                     # 手册 23.2.3 (p.1681): 切换信道后连接进入
                     # "Signaling in Progress" 重同步，UE 需重新同步才可能被调度
                     # 上行发射。给足重同步时间，避免切完立即测得全 INV。
@@ -6172,11 +9165,11 @@ class App(tk.Tk):
                         return
                 if want_current and self.psu:
                     try:
-                        idle = read_psu_snapshot(self.psu, cfg, self.log)
+                        # 旧实现紧挨着拍两次快照（idle + snap），实测两值完全一致
+                        # （间隔 <0.1s，UE 发射状态不会变），合并为一次，省 6 行/组合
                         snap = read_psu_snapshot(self.psu, cfg, self.log)
                         if snap:
-                            if idle:
-                                snap["idle_current"] = idle.get("current")
+                            snap.setdefault("idle_current", snap.get("current"))
                             # 循环前快照：UE 处于满功率发射（TX 指标刚测完），
                             # 记作 Pmax 档电流。low/both 模式还需要 Pmin 档电流，
                             # 在 low 档灵敏度测完后再采一次（见循环内）。
@@ -6213,16 +9206,24 @@ class App(tk.Tk):
                     # both 先大后小，每档独立热点续扫，结果分别落两列。
                     run_modes = ["high", "low"] if mode == "both" else [mode]
                     for pm in run_modes:
-                        hkey = (band, bw, pm)
+                        # 热点缓存按接收路径隔离：PRX/DRX/双流各走自己的口径，
+                        # 不能共用同一 (band,bw,pm) 的实测值（否则串档）。
+                        hkey = (band, bw, pm, cfg.get("rx_path", "prx"))
                         hot = sens_hotspots.get(hkey)
-                        # 首信道（无实测热点）用该 (band,bw) 的 3GPP 理论 REFSENS 作种子
+                        # 同档热点 = 本功率档刚测过上一个信道，UE 已在该档稳定，
+                        # 可跳过 warmup（真机日志统计：同档热点续扫占 99.8%，
+                        # 理论种子只出现在每个 (band,bw) 的首信道）。
+                        # 曾试过「Pmin 借 Pmax 实测值作种子」，实测收益≈0
+                        # （low 档同档热点覆盖 99.8%，理论种子仅 3 次/12.9h），
+                        # 且若 Pmin 比 Pmax 差超 ±3dB 会缩窄窗口漏拐点，故不做。
                         seed = None if hot is not None else refsens_epre_for(band, bw)
                         self.log("[灵敏度] 组合 %d/%d 功率档=%s（%s）" %
                                  (idx, total, pm, SENS_POWER_LABELS.get(pm, pm)))
                         try:
                             sens = measure_sensitivity(scpi, cfg, enabled, self.log,
                                                        band=band, bw=bw, hotspot=hot,
-                                                       theory_seed=seed, power_mode=pm)
+                                                       theory_seed=seed, power_mode=pm,
+                                                       force_warmup=hot is None)
                         except ScpiError as exc:
                             self.log("[中止] 组合 %d/%d 功率档=%s 灵敏度后 UE 恢复失败：%s" %
                                      (idx, total, pm, exc))
@@ -6241,9 +9242,10 @@ class App(tk.Tk):
                                 data["sensitivity_low"] = sens
                             if sens.get("result_epre") is not None:
                                 sens_hotspots[hkey] = sens["result_epre"]
-                                self.log("[灵敏度扫描] 热点缓存 %s/%s[%s] = %.1f dBm RS EPRE，"
+                                self.log("[灵敏度扫描] 热点缓存 %s/%s[%s][%s] = %.1f dBm RS EPRE，"
                                          "供同频段下一信道续扫" %
                                          (band_label(band), bw_label(bw), pm,
+                                          cfg.get("rx_path", "prx"),
                                           sens["result_epre"]))
                         # low/both 模式下，low 档灵敏度测完后再采一次 PSU，
                         # 记作 Pmin 档电流（循环前快照是 Pmax 档电流）
@@ -6367,6 +9369,12 @@ class App(tk.Tk):
                                      sens_power_mode=cfg.get("sens_power_mode", "high"),
                                      psu_enable=bool(cfg.get("psu_enable", True)))
                 items.append({"combo": label, "data": data, "rows": rows, "wide": wide})
+                # 断点：每测完一个组合立即落盘（原子写）。这一行是"关窗口/掉电/
+                # 崩溃都不丢进度"的关键——13 小时那次的教训就是只在收尾导出。
+                self._save_run_checkpoint(cfg, idx, total, items, sens_hotspots)
+                # 同步保存：让已完成的结果随时能打开查看，不必等整轮跑完
+                # （txt 每组合刷新；xlsx 按 partial_every / partial_interval 限频）
+                self._write_snapshot(cfg, items, _start_dt)
 
                 # --- 每列独立 FAIL 判定（单元格级标红，不再整行标红）---
                 try:
@@ -6394,15 +9402,428 @@ class App(tk.Tk):
                 "elapsed_str": _fmt_elapsed(_secs),
                 "cfg": cfg, "items": items, "all_invalid": all_invalid,
             }
+            if resume:
+                # 报告里留痕：这一份是「上次测到 X 后继续」合并出来的
+                result["resumed"] = {
+                    "from_done": start_idx,
+                    "prev_stamp": resume.get("stamp") or "",
+                    "prev_updated_at": resume.get("updated_at") or "",
+                }
             os.makedirs(RESULT_DIR, exist_ok=True)
-            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # 与 start_measurement 重建的日志文件共用时间戳，保证一一匹配
+            stamp = getattr(self, "run_stamp", None) or \
+                    datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             xlsx = os.path.join(RESULT_DIR, "LTE_%s.xlsx" % stamp)
             txt = os.path.join(RESULT_DIR, "LTE_%s.txt" % stamp)
             ok, err = export_results(result, xlsx, txt)
             result["export"] = {"xlsx": xlsx, "txt": txt, "ok": ok, "err": err}
+            # 导出成功 → 本轮结束，断点作废；导出失败则保留断点（done==total），
+            # 下次启动仍可"续测"一次把这份数据重新导出，不会重复测量。
+            if ok:
+                clear_checkpoint()
+                self._cleanup_snapshots()   # 正式报告已出，过程中的快照不再需要
+                self.log("[断点续测] 本轮已全部完成并导出，断点已清除")
+            else:
+                self.log("[断点续测] ⚠️ 导出失败，断点保留：重启工具后可再跑一次重新导出")
             self.msg_queue.put(("result", result))
+        except Exception as exc:
+            tb = traceback.format_exc()
+            # 真机事故（LTE_20261126_195411）：连续跑 13.4 小时、完成 1629/7096
+            # 个组合后，一次瞬时 STAT? 超时把整轮打断；而导出只在正常收尾执行，
+            # 于是 13 小时的数据一个文件都没留下。这里补一条应急导出，把已经测完
+            # 的组合存成 *_partial.xlsx / .txt，宁可带"中途中断"标记也不丢数据。
+            try:
+                _done_items = locals().get("items") or []
+                if _done_items:
+                    self._export_partial(_done_items, locals().get("_start_dt"),
+                                         locals().get("cfg") or {}, exc)
+            except Exception as _e:
+                self.log("[导出] 中断应急导出失败：%s（原始数据见日志）" % _e)
+            # 断点已在每个组合结束时落盘：重启工具会自动从下一个组合接着测
+            _n_done = len(locals().get("items") or [])
+            if _n_done:
+                self.log("[断点续测] 本轮中断，已完成 %d 个组合的断点已保留，"
+                         "重启工具会自动接着测" % _n_done)
+            else:
+                self.log("[断点续测] 本轮中断时还没有完成的组合，无断点可续")
+            self.msg_queue.put(("error", tb))
+
+    def _export_partial(self, items, start_dt, cfg, exc):
+        """异常中断时导出已完成组合，文件名带 _partial，避免与完整结果混淆。"""
+        now = datetime.datetime.now()
+        sdt = start_dt or now
+        secs = max(0.0, (now - sdt).total_seconds())
+        result = {
+            "time": now.isoformat(timespec="seconds"),
+            "start_time": sdt.isoformat(timespec="seconds"),
+            "end_time": now.isoformat(timespec="seconds"),
+            "elapsed_sec": round(secs, 1),
+            "elapsed_str": _fmt_elapsed(secs),
+            "cfg": cfg, "items": items, "all_invalid": False,
+            "interrupted": True,
+            "interrupt_reason": "%s: %s" % (type(exc).__name__, exc),
+        }
+        os.makedirs(RESULT_DIR, exist_ok=True)
+        stamp = getattr(self, "run_stamp", None) or now.strftime("%Y%m%d_%H%M%S")
+        xlsx = os.path.join(RESULT_DIR, "LTE_%s_partial.xlsx" % stamp)
+        txt = os.path.join(RESULT_DIR, "LTE_%s_partial.txt" % stamp)
+        ok, err = export_results(result, xlsx, txt)
+        self.log("[导出] 中途异常，已把完成 %d 个组合导到 %s%s"
+                 % (len(items), os.path.basename(xlsx),
+                    "" if ok else "（失败：%s）" % err))
+
+    # ---------------- 过程中同步保存 ----------------
+    def _snapshot_paths(self):
+        """过程中快照的两个路径（与最终报告同名 + _partial 后缀，不会混淆）。"""
+        stamp = getattr(self, "run_stamp", None) or \
+                datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(RESULT_DIR, "LTE_%s_partial" % stamp)
+        return base + ".xlsx", base + ".txt"
+
+    def _cleanup_snapshots(self):
+        """正常跑完并导出正式报告后删掉过程中快照，避免和正式结果混在一起。"""
+        xlsx, txt = self._snapshot_paths()
+        for p in (xlsx, txt, xlsx + ".tmp"):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    def _write_snapshot(self, cfg, items, start_dt, force_xlsx=False):
+        """测试过程中同步落盘，让已完成的结果随时能打开。
+
+        跑满 7000 个组合要 50 小时，中途任何意外都不该让"已测数据"只存在于
+        内部断点里（jsonl 只有工具自己看得懂）。所以：
+          - txt：每次调用都重写（<10ms），每个组合结束就更新，永远是最新的；
+          - xlsx：要重建整张表，按"每 N 个组合 / 每 T 秒"限频，避免拖慢测量。
+        两者都不含「灵敏度探底」明细页（7096 组合会到 10 万行，重写要几秒），
+        明细只在跑完的正式导出里给。
+        """
+        try:
+            if not items:
+                return False
+            if str(cfg.get("partial_save", "true")).strip().lower() in \
+                    ("false", "0", "no", "off"):
+                return False
+            now = datetime.datetime.now()
+            sdt = start_dt or now
+            secs = max(0.0, (now - sdt).total_seconds())
+            total = len(cfg.get("combos") or []) or len(items)
+            result = {
+                "time": now.isoformat(timespec="seconds"),
+                "start_time": sdt.isoformat(timespec="seconds"),
+                "end_time": now.isoformat(timespec="seconds"),
+                "elapsed_sec": round(secs, 1),
+                "elapsed_str": _fmt_elapsed(secs),
+                "cfg": cfg, "items": list(items), "all_invalid": False,
+                "snapshot": True, "progress": len(items), "total": total,
+            }
+            os.makedirs(RESULT_DIR, exist_ok=True)
+            xlsx, txt = self._snapshot_paths()
+
+            # ---- txt：每个组合都重写，成本可忽略 ----
+            ok_t, err_t = export_results(result, None, txt, detail=False)
+            if not ok_t and not getattr(self, "_snap_warned_txt", False):
+                self._snap_warned_txt = True
+                self.log("[同步保存] ⚠️ 快照 txt 写入失败：%s（不影响测量，"
+                         "可能文件正被 Excel/记事本占用）" % err_t)
+
+            # ---- xlsx：限频重建 ----
+            every = max(1, int(cfg.get("partial_every") or 20))
+            interval = max(30, int(cfg.get("partial_interval") or 300))
+            last = getattr(self, "_snap_xlsx_ts", None)
+            due = (force_xlsx or last is None or len(items) % every == 0 or
+                   (now - last).total_seconds() >= interval)
+            if not due:
+                return True
+
+            tmp = xlsx + ".tmp"
+            ok_x, err_x = export_results(result, tmp, txt, detail=False)
+            if ok_x:
+                try:
+                    os.replace(tmp, xlsx)
+                    self._snap_xlsx_ts = now
+                    self.log("[同步保存] 已完成 %d/%d（%s，%.1f%%）→ %s"
+                             % (len(items), total, _fmt_elapsed(secs),
+                               100.0 * len(items) / max(total, 1),
+                               os.path.basename(xlsx)))
+                except Exception as exc:
+                    # 目标文件被 Excel 打开时会拒绝替换：删掉 tmp，下次再刷
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                    self.log("[同步保存] 快照 xlsx 未能更新（%s），稍后自动重试" % exc)
+            else:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                if not getattr(self, "_snap_warned_xlsx", False):
+                    self._snap_warned_xlsx = True
+                    self.log("[同步保存] ⚠️ 快照 xlsx 写入失败：%s（不影响测量）" % err_x)
+            return True
+        except Exception as exc:
+            # 同步保存绝不允许影响测量
+            self.log("[同步保存] 跳过本次（%s）" % exc)
+            return False
+
+    # ---------------- 断点续测 ----------------
+    def _save_run_checkpoint(self, cfg, done, total, items, hotspots):
+        """每测完一个组合落一次断点：明细追加 + meta 原子写。
+
+        明细（.items.jsonl）只追加本次新增的组合，写入量与组合数成正比；
+        meta 只存 stamp/进度/指纹/热点等小字段，整写成本恒定。
+        两者都是"宁可少记一点，也不会记错"：meta 落后 → 读时按 done 截断重测 1 个；
+        明细比 meta 短 → 以实际条数为准，绝不把没落盘的组合当成已完成。
+        """
+        st = {
+            "version": CHECKPOINT_VERSION,
+            "stamp": getattr(self, "run_stamp", "") or "",
+            "created_at": self._run_created_at or "",
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "cfg_key": resume_fingerprint(cfg),
+            "combos": [list(c) for c in cfg["combos"]],
+            "total": int(total), "done": int(done),
+            # tuple 键（band,bw,pm,path）在 JSON 里必须转成列表，读回再还原
+            "hotspots": [[list(k), v] for k, v in hotspots.items()],
+            "summary": {
+                "bands": list(cfg.get("bands") or []),
+                "metrics": sorted(k for k, v in (cfg.get("metrics") or {}).items() if v),
+                "scenario": cfg.get("power_scenario"),
+                "rx_path": cfg.get("rx_path"),
+                "combo": cfg.get("rf_port_combo") or "",
+            },
+        }
+        _written = int(getattr(self, "_ckpt_items_written", 0) or 0)
+        _new = list(items)[max(0, _written):]
+        # 首次写入（从头测 or 续测首个组合）重建明细；之后只追加
+        _reset = _written <= 0
+        if _new or _reset:
+            if append_checkpoint_items(_new, reset=_reset):
+                self._ckpt_items_written = len(items)
+            elif not self._ckpt_warned:
+                self._ckpt_warned = True
+                self.log("[断点续测] ⚠️ 断点明细写入失败（目录只读/磁盘满/被占用？）："
+                         "本次若中断将无法续测，请检查 %s"
+                         % os.path.dirname(checkpoint_path()))
+        if not write_checkpoint_meta(st) and not self._ckpt_warned:
+            self._ckpt_warned = True
+            self.log("[断点续测] ⚠️ 断点进度写入失败（目录只读/磁盘满？）："
+                     "本次若中断将无法续测，请检查 %s"
+                     % os.path.dirname(checkpoint_path()))
+
+    def _restore_resume_rows(self, st, cfg):
+        """把断点里已完成的行回填到结果表，续测时进度从断点接着走。"""
+        items = st.get("items") or []
+        if not items:
+            return
+        self._set_status("断点续测：回填已完成 %d 行…" % len(items))
+        self.log("[断点续测] 回填 %d 个已完成组合到结果表" % len(items))
+        for i, it in enumerate(items, 1):
+            wide = list(it.get("wide") or [])
+            vals = wide[:self.wide_col_count]
+            try:
+                flags = _build_fail_flags(vals, it.get("combo") or "", cfg)
+            except Exception:
+                flags = [False] * len(vals)
+            self._append_result_row(vals, flags)
+            if i % 200 == 0:
+                try:
+                    self.update()   # 分批刷新：1600 行回填时窗口不至于看起来卡死
+                except Exception:
+                    pass
+        # 回填完停在最后一行：紧接着新测的行会从这里继续往下加
+        try:
+            self.after_idle(self._scroll_res_to_latest)
         except Exception:
-            self.msg_queue.put(("error", traceback.format_exc()))
+            pass
+
+    def _confirm_resume(self, st, cfg):
+        """点【开始测量】时发现断点：配置一致问续不续，不一致直接丢弃从头测。"""
+        try:
+            _match = (resume_fingerprint(cfg) == st.get("cfg_key"))
+        except Exception:
+            _match = False
+        _sum = st.get("summary") or {}
+        _desc = ("上次运行：%s\n进度：%d / %d 个组合\n指标：%s｜场景：%s｜RF口：%s"
+                 % (st.get("stamp") or "?", st["done"], st["total"],
+                    ",".join(_sum.get("metrics") or []) or "-",
+                    SENS_POWER_LABELS.get(_sum.get("scenario"),
+                                          _sum.get("scenario") or "-"),
+                    _sum.get("combo") or "自定义"))
+        if not _match:
+            messagebox.showinfo(
+                "发现断点（配置已变更）",
+                "%s\n\n当前频段/带宽/指标/场景/RF口/门限与断点不同，"
+                "已完成的数据与新口径不可比，本次从头测（旧断点已丢弃）。" % _desc)
+            clear_checkpoint()
+            self.log("[断点续测] 配置与断点不一致，已丢弃断点，从头测")
+            return None
+        if messagebox.askyesno(
+                "发现未完成的测试 — 是否续测？",
+                "%s\n\n点【是】从第 %d 个组合继续（已完成结果保留，最终合并成一份报告）；\n"
+                "点【否】从头重新测（旧断点将被丢弃）。" % (_desc, st["done"] + 1)):
+            return st
+        clear_checkpoint()
+        self.log("[断点续测] 用户选择从头测，已丢弃断点")
+        return None
+
+    def _auto_resume_check(self):
+        """启动后自动发现断点：配置一致就倒计时自动续测，不一致只提示不跑。"""
+        st = read_checkpoint()
+        if not st:
+            return
+        # done==total 只可能是"跑完但导出失败"遗留：没有待测组合，不自动开跑
+        if st["done"] >= st["total"]:
+            self.log("[断点续测] 断点显示已测完 %d/%d（疑似导出失败遗留），不自动续测；"
+                     "点【开始测量】可重新导出" % (st["done"], st["total"]))
+            return
+        if not bool(self.cfg_loaded.get("auto_resume", True)):
+            self.log("[断点续测] 发现未完成运行（%d/%d），但 auto_resume=false，未自动续测；"
+                     "点【开始测量】会询问是否继续。" % (st["done"], st["total"]))
+            return
+        # 断点太旧（隔了好几天）时现场条件多半已变，不自动跑，只保留手动入口
+        try:
+            max_h = float(self.cfg_loaded.get("auto_resume_max_hours", "72") or 0)
+        except (TypeError, ValueError):
+            max_h = 72.0
+        if max_h > 0:
+            try:
+                _upd = datetime.datetime.fromisoformat(str(st.get("updated_at") or ""))
+                _age_h = (datetime.datetime.now() - _upd).total_seconds() / 3600.0
+            except Exception:
+                _age_h = 0.0
+            if _age_h > max_h:
+                self.log("[断点续测] 断点是 %.1f 小时前的（阈值 %.0f h），现场条件多半已变，"
+                         "不自动续测；点【开始测量】可手动继续。" % (_age_h, max_h))
+                return
+        try:
+            cfg_now = self._read_cfg()
+        except ValueError as exc:
+            self.log("[断点续测] 当前配置不完整（%s），不自动续测" % exc)
+            return
+        if resume_fingerprint(cfg_now) != st.get("cfg_key"):
+            self.log("[断点续测] 发现断点（%s，已完成 %d/%d），但当前配置与断点不一致，"
+                     "未自动续测 —— 避免两套口径的数据拼进同一份报告。"
+                     % (st.get("stamp") or "?", st["done"], st["total"]))
+            self._show_auto_notice(
+                "发现断点（配置不一致）",
+                "上次运行测到 %d/%d 个组合，但当前频段/带宽/指标/场景/RF口/门限"
+                "与断点不同。\n\n为避免两种口径的数据混在一份报告里，本次未自动续测。\n"
+                "点【开始测量】会提示从头测。" % (st["done"], st["total"]))
+            return
+        try:
+            delay = int(float(self.cfg_loaded.get("auto_resume_delay", "10") or 10))
+        except (TypeError, ValueError):
+            delay = 10
+        delay = max(0, min(120, delay))
+        self._offer_resume(st, delay)
+
+    def _offer_resume(self, st, delay):
+        """非模态倒计时窗：delay 秒后自动初始化并续测，期间可取消。"""
+        _sum = st.get("summary") or {}
+        _base = ("检测到上次未完成的测试：\n\n"
+                 "运行：%s\n进度：%d / %d 个组合（%d%%）\n"
+                 "指标：%s｜场景：%s｜RF口：%s\n断点时间：%s\n"
+                 % (st.get("stamp") or "?", st["done"], st["total"],
+                    int(round(100.0 * st["done"] / max(1, st["total"]))),
+                    ",".join(_sum.get("metrics") or []) or "-",
+                    SENS_POWER_LABELS.get(_sum.get("scenario"),
+                                          _sum.get("scenario") or "-"),
+                    _sum.get("combo") or "自定义",
+                    st.get("updated_at") or "?"))
+        try:
+            win = tk.Toplevel(self)
+            win.title("断点续测")
+            win.transient(self)
+            win.resizable(False, False)
+            lab = tk.Label(win, text=_base, justify="left", padx=18, pady=12)
+            lab.pack()
+            bar = ttk.Frame(win)
+            bar.pack(pady=(0, 12))
+            state = {"left": delay, "job": None}
+
+            def _cancel_timer():
+                if state["job"]:
+                    try:
+                        self.after_cancel(state["job"])
+                    except Exception:
+                        pass
+                    state["job"] = None
+
+            def _cancel():
+                _cancel_timer()
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                self.log("[断点续测] 已取消自动续测（断点保留，点【开始测量】可手动继续）")
+
+            def _tick():
+                state["job"] = None
+                try:
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                if state["left"] <= 0:
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self._finish_resume_offer(st)
+                    return
+                lab.config(text=_base + "\n%d 秒后自动开始续测…" % state["left"])
+                state["left"] -= 1
+                state["job"] = self.after(1000, _tick)
+
+            def _now():
+                _cancel_timer()
+                state["left"] = 0
+                _tick()
+
+            ttk.Button(bar, text="现在继续", width=10, command=_now).pack(side="left", padx=6)
+            ttk.Button(bar, text="取消", width=8, command=_cancel).pack(side="left", padx=6)
+            win.update_idletasks()
+            cx = self.winfo_rootx() + self.winfo_width() // 2
+            cy = self.winfo_rooty() + self.winfo_height() // 2
+            win.geometry("+%d+%d" % (max(0, cx - win.winfo_reqwidth() // 2),
+                                     max(0, cy - win.winfo_reqheight() // 2)))
+            _tick()
+        except Exception as exc:
+            # GUI 出问题也不能让自动续测彻底失效：退化成"立即继续"
+            self.log("[断点续测] 倒计时窗口创建失败（%s），立即自动续测" % exc)
+            self.after(200, lambda: self._finish_resume_offer(st))
+
+    def _finish_resume_offer(self, st):
+        """倒计时结束：再校验一次配置（期间用户可能改过），然后自动开跑。"""
+        if self.busy:
+            self.log("[断点续测] 当前有操作进行中，跳过自动续测（断点保留）")
+            return
+        try:
+            cfg_now = self._read_cfg()
+        except ValueError as exc:
+            self.log("[断点续测] 配置不完整（%s），跳过自动续测（断点保留）" % exc)
+            return
+        if resume_fingerprint(cfg_now) != st.get("cfg_key"):
+            self.log("[断点续测] 倒计时期间配置已变更，跳过自动续测（断点保留）")
+            self._show_auto_notice(
+                "已跳过自动续测",
+                "配置在倒计时期间发生变化，本次不自动续测。\n"
+                "断点已保留：点【开始测量】会询问是否继续。")
+            return
+        self._begin_resume(st)
+
+    def _begin_resume(self, st):
+        """断点续测正式开跑：先按待测组合建网（初始化），再接着测。"""
+        self.log("[断点续测] 自动继续：已完成 %d/%d，从第 %d 个组合开始"
+                 % (st["done"], st["total"], st["done"] + 1))
+        self._set_status("断点续测：正在自动初始化仪表…")
+        self._resume_pending = st
+        self._resume_start_idx = int(st["done"])
+        self.initialize()
 
     def _open_config(self):
         """打开 config.json（系统默认 JSON 编辑器），方便修改 freq_loss_segments 等参数。"""
@@ -6435,6 +9856,7 @@ class App(tk.Tk):
         ms = max(500, min(60000, ms))
         try:
             win = tk.Toplevel(self)
+            win.withdraw()  # 先隐藏，定位完成后再显示，避免从左上角闪现
             win.title(title)
             win.transient(self)
             win.resizable(False, False)
@@ -6442,6 +9864,13 @@ class App(tk.Tk):
                      padx=18, pady=14).pack()
             tk.Button(win, text="确定", width=8,
                       command=lambda: _close_tk_window(win)).pack(pady=(0, 12))
+            # 相对主窗口正居中：弹框中心 = 主窗口中心（上下左右均对齐）
+            win.update_idletasks()
+            pw, ph = win.winfo_reqwidth(), win.winfo_reqheight()
+            cx = self.winfo_rootx() + self.winfo_width() // 2
+            cy = self.winfo_rooty() + self.winfo_height() // 2
+            win.geometry("+%d+%d" % (max(0, cx - pw // 2), max(0, cy - ph // 2)))
+            win.deiconify()
             win.after(ms, lambda: _close_tk_window(win))
         except Exception:
             # 任何 GUI 异常都只写日志，绝不阻塞测量流程
@@ -6472,15 +9901,26 @@ class App(tk.Tk):
                         pass
                     continue
                 if kind == "at_ports":
-                    # payload = (端口名列表, 握手成功的 AT 口)；更新下拉框与选中值
-                    names, found = payload
+                    # payload = (端口名列表, 建议默认口[, 是否手动检测])
+                    # 手动点【检测】：直接切到推荐口（modem device 优先）；
+                    # 启动静默枚举：已选/已保存的口仍在列表则保持，否则回落推荐口
+                    payload = list(payload) + [False, False]
+                    names, suggest, manual = payload[0], payload[1], bool(payload[2])
                     try:
                         cur = self.at_port_var.get().strip()
-                        vals = list(dict.fromkeys(["auto"] + list(names)))
+                        vals = list(dict.fromkeys(list(names)))
                         self.at_port_cb.config(values=vals)
-                        if found and (not cur or cur.lower() == "auto"):
-                            self.at_port_var.set(found)
-                        self._at_port_detected = found
+                        if manual and suggest:
+                            self.at_port_var.set(suggest)     # 显式检测 → 重选推荐口
+                        elif cur and cur in vals:
+                            pass                              # 保持用户/上次选择
+                        elif suggest:
+                            self.at_port_var.set(suggest)     # 首次或换口后默认
+                        elif cur.lower() == "auto":
+                            self.at_port_var.set("")          # 旧配置残留值
+                        self._at_port_detected = self.at_port_var.get().strip()
+                        if self.at_port_var.get().strip() != cur:
+                            self._save_at_port_only()         # 自动选定后立即落盘
                     except Exception:
                         pass
                     continue
@@ -6503,6 +9943,12 @@ class App(tk.Tk):
                     self.log("[初始化] " + payload)
                     # 自动消失，无需人工点击确认（时间由 init_popup_ms 配置）
                     self._show_auto_notice("初始化完成", payload)
+                    # 断点续测：初始化完成即自动接着测，不再要求用户点【开始测量】。
+                    # 延 400ms 让上面那个"初始化完成"提示先出现，避免两个窗口叠在一起。
+                    _st = self._resume_pending
+                    if _st:
+                        self._resume_pending = None
+                        self.after(400, lambda s=_st: self.start_measurement(resume=s))
                 elif kind == "result":
                     self._show_result(payload)
                 elif kind == "measure_failed":
@@ -6511,6 +9957,11 @@ class App(tk.Tk):
                     self.log("[测量中止] " + payload)
                     messagebox.showerror("测量中止 — 上行信号无效（见 Reliability 诊断）", payload)
                 else:
+                    if self._resume_pending:
+                        self.log("[断点续测] 自动续测失败（见上方错误），断点仍保留；"
+                                 "修好仪表/UE 后点【开始测量】可继续")
+                        self._resume_pending = None
+                        self._resume_start_idx = 0
                     self._set_status("出错，详见日志")
                     self.log("[错误]\n" + payload)
                     messagebox.showerror("操作失败", payload[-800:])
@@ -6524,6 +9975,11 @@ class App(tk.Tk):
                          (type(_e).__name__, _tb.format_exc(limit=3)))
             except Exception:
                 pass
+        # 参数配置在外部被修改时自动同步 RF 口/下拉（测量中不刷新）
+        try:
+            self._maybe_reload_config()
+        except Exception:
+            pass
         self.after(80, self._poll_queue)
 
     # ---------------- Frame+Label 网格结果表（单元格级标红） ----------------
@@ -6589,24 +10045,39 @@ class App(tk.Tk):
                 w.bind("<MouseWheel>", self._on_res_mousewheel)
                 w.bind("<Shift-MouseWheel>", self._on_res_mousewheel)
 
-        # --- 销毁旧内部 grid 并重建 ---
-        # 先删除 Canvas 里的旧 window item：只 destroy frame 会留下尺寸陈旧的
-        # item，bbox("all") 仍是旧列宽，导致指标勾少后横向滚动条不消失。
+        # --- 销毁旧内容并重建 ---
+        # 数据行不再使用 frame+Label（每行每列一个控件）：1581 组合 = 3.6 万控件，
+        # 插入耗时上百秒；更致命的是 Canvas 内嵌窗口（create_window 的 frame）
+        # 在 y 超过约 32767px 后不再渲染——1581 行 × 23px = 36363px，实测滚到底
+        # 整片空白（用户反馈"测到一定数量就不显示"）。
+        # 改为 Canvas 原生 item：文本/矩形不是窗口，36000px 处仍正常显示；
+        # 且只渲染可视行（见 _sync_visible_rows），item 总数恒定，插入 O(1)。
         for cv in (self._res_canvas, self._left_canvas, self._hdr_canvas):
             cv.delete("all")
         for name in ("_grid_frame", "_left_frame", "_hdr_frame"):
             old = getattr(self, name, None)
             if old is not None:
-                old.destroy()
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
+        # 兼容旧属性名：置空避免残留引用（数据已改由 canvas item 承载）
+        self._grid_frame = None
+        self._left_frame = None
         for w in self._corner.winfo_children():
             w.destroy()
-        self._grid_frame = ttk.Frame(self._res_canvas)     # 指标列（数据行）
-        self._left_frame = ttk.Frame(self._left_canvas)    # 左 3 列（数据行）
-        self._hdr_frame = ttk.Frame(self._hdr_canvas)      # 指标列表头
-        self._res_canvas.create_window((0, 0), window=self._grid_frame, anchor="nw")
-        self._left_canvas.create_window((0, 0), window=self._left_frame, anchor="nw")
+        self._hdr_frame = ttk.Frame(self._hdr_canvas)      # 指标列表头（数量少，仍用控件）
         self._hdr_canvas.create_window((0, 0), window=self._hdr_frame, anchor="nw")
-        self._grid_row = 0
+        # 数据容器：全量数据留在内存，canvas 上只画可视行
+        self._rows = []          # [(wide_vals, fail_flags), ...]
+        self._items = {}         # 行号 -> [(canvas, item_id), ...]
+        self._grid_row = 0       # 已接收行数（= len(self._rows)）
+        self._auto_follow = True  # 是否跟随最新行（用户上翻查看历史时置 False）
+        self._metric_cols = max(0, len(headers) - prefix_n)
+        try:
+            self._cell_font = tkfont.nametofont("TkDefaultFont")
+        except Exception:
+            self._cell_font = "TkDefaultFont"
 
         # 表头加粗字体
         _hdr_font = tkfont.nametofont("TkDefaultFont")
@@ -6641,27 +10112,23 @@ class App(tk.Tk):
             self.res_frame.grid_rowconfigure(0, weight=0, minsize=hdr_h)
         except Exception:
             pass
-        # 列宽 / 行高固定，保证四个区域逐格对齐
+        # 列宽固定：表头（corner / hdr_frame）按控件列宽；数据行按像素坐标直接绘制，
+        # 两者共用同一组列宽，保证表头与数据逐列对齐。
         nm = max(0, len(headers) - prefix_n)
         for fr, count, w in ((self._corner, prefix_n, self._prefix_w),
-                             (self._left_frame, prefix_n, self._prefix_w),
-                             (self._hdr_frame, nm, self._metric_w),
-                             (self._grid_frame, nm, self._metric_w)):
+                             (self._hdr_frame, nm, self._metric_w)):
             for ci in range(count):
                 fr.columnconfigure(ci, minsize=w, weight=0)
         for fr in (self._corner, self._hdr_frame):
             fr.rowconfigure(0, minsize=hdr_h, weight=0)
-        # scrollregion 跟随内部 frame 尺寸
-        for fr, cv in ((self._grid_frame, self._res_canvas),
-                       (self._left_frame, self._left_canvas),
-                       (self._hdr_frame, self._hdr_canvas)):
-            def _cfg(_evt, _cv=cv):
-                bb = _cv.bbox("all")
-                if bb:
-                    _cv.configure(scrollregion=bb)
-                # 行增删会改变内容宽度，需重判横向滚动条
-                self.after_idle(self._update_res_hsb)
-            fr.bind("<Configure>", _cfg)
+        # 表头尺寸变化（字体/列数）→ 重判横向滚动条与可视行
+        def _cfg(_evt=None):
+            self.after_idle(self._update_res_hsb)
+            self.after_idle(self._sync_visible_rows)
+        self._hdr_frame.bind("<Configure>", _cfg)
+        for cv in (self._res_canvas, self._left_canvas):
+            cv.bind("<Configure>", _cfg, add="+")
+        self._sync_scrollregion()
         # 列数变化后立刻判断横向滚动条；首次渲染后再判一次（窗口尚未映射时宽度为1）
         self._sync_res_hsb_now()
         self.after_idle(self._update_res_hsb)
@@ -6675,18 +10142,28 @@ class App(tk.Tk):
     def _on_res_yscroll(self, first, last):
         self._res_vsb.set(first, last)
         self._left_canvas.yview_moveto(float(first))
+        # 是否停在底部 → 决定有新行时是否自动跟随；用户上翻看历史时不打扰
+        try:
+            self._auto_follow = float(last) >= 0.999
+        except (TypeError, ValueError):
+            self._auto_follow = True
+        # 虚拟化：滚动后重算可视行（只增删进出视口的行）
+        self.after_idle(self._sync_visible_rows)
 
     def _scroll_res_to_latest(self):
         """结果行更新后自动滚到最新一行（冻结左列由 yscrollcommand 同步）。
 
-        放在 after_idle 执行，确保新行的 <Configure> 已把 scrollregion 撑大，
-        否则 yview_moveto(1.0) 会按旧的可视范围计算而滚不到底部。
+        虚拟化后不能依赖 frame 的 <Configure> 撑大 scrollregion，
+        必须先按行数更新 scrollregion 再 yview_moveto(1.0)，否则滚不到底部。
         """
         cv = getattr(self, "_res_canvas", None)
         if cv is None:
             return
         try:
+            self._sync_scrollregion()
             cv.yview_moveto(1.0)
+            self._auto_follow = True
+            self._sync_visible_rows()
         except Exception:
             pass
 
@@ -6697,28 +10174,125 @@ class App(tk.Tk):
             return
         try:
             cv.yview_moveto(0.0)
+            self._auto_follow = True
+            self._sync_visible_rows()
         except Exception:
             pass
 
     def _on_res_canvas_config(self, _evt=None):
-        """可视区尺寸变化后决定是否显示横向滚动条（列少时能完整显示就不显示）。"""
+        """可视区尺寸变化后重判横向滚动条并重算可视行。"""
         self.after_idle(self._update_res_hsb)
+        self.after_idle(self._sync_visible_rows)
+
+    def _sync_scrollregion(self):
+        """按行数/列数设置三个 canvas 的滚动范围。
+
+        虚拟化后画布上只有可视行的 item，bbox("all") 不再代表整张表，
+        滚动范围必须用「行数 × 行高」「列数 × 列宽」计算。
+
+        表头 canvas 也必须显式设 scrollregion：不设时 Tk 把它当成不可滚动的
+        定长画布，xview 永远是 (0,1)，xview_moveto 无效 → 数据左右滑动时
+        表头纹丝不动（实际就是表头与数据错开）。
+        """
+        try:
+            h = max(len(self._rows) * RESULT_ROW_H, 1)
+            wl = max(self.RESULT_PREFIX_COLS * self._prefix_w, 1)
+            wm = max(self._metric_cols * self._metric_w, 1)
+            self._left_canvas.configure(scrollregion=(0, 0, wl, h))
+            self._res_canvas.configure(scrollregion=(0, 0, wm, h))
+            # 表头与主区共用同一内容宽度，比例→像素的换算才能逐列对齐；
+            # 高度取表头自身高度，保证表头不会被纵向拖动。
+            bb = self._hdr_canvas.bbox("all")
+            hdr_h = bb[3] if bb else RESULT_HEADER_H
+            self._hdr_canvas.configure(scrollregion=(0, 0, wm, max(hdr_h, 1)))
+        except Exception:
+            pass
+
+    def _visible_rows(self):
+        """返回当前视口对应的行号区间 [first, last)，上下各留 4 行缓冲。"""
+        n = len(getattr(self, "_rows", ()) or ())
+        if not n:
+            return 0, 0
+        cv = getattr(self, "_res_canvas", None)
+        if cv is None:
+            return 0, 0
+        try:
+            h = max(cv.winfo_height(), RESULT_ROW_H)
+            top = cv.canvasy(0)
+        except Exception:
+            return 0, min(n, 8)
+        first = int(top // RESULT_ROW_H) - 4
+        last = int((top + h) // RESULT_ROW_H) + 5
+        return max(0, first), min(n, max(last, first + 1))
+
+    def _render_row(self, r):
+        """把第 r 行画到两个 canvas 上（矩形 + 文本，均为原生 item）。"""
+        vals, flags = self._rows[r]
+        y = r * RESULT_ROW_H
+        bg = "#ffffff" if r % 2 == 0 else "#fafafa"
+        prefix_n = self.RESULT_PREFIX_COLS
+        ids = []
+        n = min(len(vals), self.wide_col_count)
+        for ci in range(n):
+            text = "" if vals[ci] is None else str(vals[ci])
+            bad = bool(ci < len(flags) and flags[ci])
+            if ci < prefix_n:
+                cv, x, w = self._left_canvas, ci * self._prefix_w, self._prefix_w
+            else:
+                cv = self._res_canvas
+                x = (ci - prefix_n) * self._metric_w
+                w = self._metric_w
+            ids.append((cv, cv.create_rectangle(
+                x + 1, y + 1, x + w - 1, y + RESULT_ROW_H - 1,
+                fill=bg, outline="#d9d9d9")))
+            ids.append((cv, cv.create_text(
+                x + w // 2, y + RESULT_ROW_H // 2 + 1, text=text, anchor="center",
+                fill="#d32f2f" if bad else "#333333", font=self._cell_font)))
+        self._items[r] = ids
+
+    def _sync_visible_rows(self):
+        """只保留视口内的行 item：滑出即删、滑入即画（item 总数恒定）。"""
+        if not hasattr(self, "_items") or not hasattr(self, "_rows"):
+            return
+        if not self._rows:
+            return
+        first, last = self._visible_rows()
+        want = set(range(first, last))
+        # 批量删除（逐个 delete 每个 item 一次 Tcl 调用，滚动时明显发涩）
+        drop = [r for r in self._items if r not in want]
+        if drop:
+            left_ids, res_ids = [], []
+            for r in drop:
+                for cv, iid in self._items.pop(r):
+                    if cv is self._left_canvas:
+                        left_ids.append(iid)
+                    else:
+                        res_ids.append(iid)
+            try:
+                if left_ids:
+                    self._left_canvas.delete(*left_ids)
+                if res_ids:
+                    self._res_canvas.delete(*res_ids)
+            except Exception:
+                pass
+        for r in range(first, last):
+            if r not in self._items and r < len(self._rows):
+                self._render_row(r)
 
     def _update_res_hsb(self):
         """指标列总宽 > 可视宽度才显示横向滚动条；否则隐藏并归零横向偏移。
 
-        勾选指标后、出数据前主区内部 frame 宽度只有 1px（没有子控件），
-        因此列总宽必须取「主区 bbox」与「表头 bbox」的较大值，
-        这样横向滚动条（左右滑）会随勾选即时出现，不必等开始测试。
+        虚拟化后内容宽度不能取自 bbox("all")（只有可视行），改用列宽×列数，
+        并取表头实际宽度（字体放大时表头可能略宽）作为下限。
         """
         cv = getattr(self, "_res_canvas", None)
         hsb = getattr(self, "_res_hsb", None)
         if cv is None or hsb is None:
             return
         try:
-            bb = cv.bbox("all")
             bb_hdr = self._hdr_canvas.bbox("all")
-            content_w = max(bb[2] if bb else 0, bb_hdr[2] if bb_hdr else 0)
+            content_w = max(self._metric_cols * self._metric_w,
+                            bb_hdr[2] if bb_hdr else 0)
             view_w = cv.winfo_width()
             if view_w <= 1 or content_w <= 0:
                 return
@@ -6731,19 +10305,16 @@ class App(tk.Tk):
                 # 隐藏滚动条时回到最左，避免停在不可见的滚动位置
                 cv.xview_moveto(0.0)
                 self._hdr_canvas.xview_moveto(0.0)
-            # 主区 scrollregion 至少覆盖表头宽度：空表时也能滚到最后几列，
-            # 且与表头 Canvas 使用同一比例，横滚时首行与数据行不错位。
-            w = max(bb[2] if bb else 0, bb_hdr[2] if bb_hdr else 0)
-            h = max(bb[3] if bb else 0, 1)
-            cv.configure(scrollregion=(0, 0, w, h))
+            self._sync_scrollregion()
         except Exception:
             pass
 
     def _sync_res_hsb_now(self):
-        """列重建后立即按新内容宽度刷新横向滚动条可见性。"""
+        """列重建后立即按新内容宽度刷新横向滚动条可见性与可视行。"""
         try:
             self._res_canvas.update_idletasks()
             self._update_res_hsb()
+            self._sync_visible_rows()
         except Exception:
             pass
 
@@ -6756,39 +10327,38 @@ class App(tk.Tk):
             self._res_canvas.yview_scroll(_n, "units")
 
     def _append_result_row(self, wide_vals, fail_flags):
-        """追加一行：左 3 列进冻结区，其余进主区；FAIL 单元格单独标红。"""
-        if not hasattr(self, "_grid_frame") or self._grid_frame is None:
+        """追加一行数据：写入内存 + 只渲染可视行（Canvas 原生 item，不创建控件）。
+
+        之前的实现每格一个 ttk.Label，1581 组合 = 3.6 万控件：插入耗时上百秒，
+        且 Canvas 内嵌窗口在 y > 32767px 后不渲染（约 1425 行后整片消失）。
+        现在画布 item 总数只与视口高度相关，行数再多也不变慢、不会消失。
+        """
+        if not hasattr(self, "_rows"):
             return
-        r = self._grid_row
-        self._grid_row += 1
-        prefix_n = self.RESULT_PREFIX_COLS
-        n = min(len(wide_vals), self.wide_col_count)
-        for ci in range(n):
-            text = str(wide_vals[ci]) if wide_vals[ci] is not None else ""
-            is_fail = bool(ci < len(fail_flags) and fail_flags[ci])
-            fg = "#d32f2f" if is_fail else "#333333"
-            if ci < prefix_n:
-                parent, col = self._left_frame, ci
-            else:
-                parent, col = self._grid_frame, ci - prefix_n
-            _wl = (self._prefix_w if ci < prefix_n else self._metric_w) - 6
-            ttk.Label(parent, text=text, foreground=fg,
-                      anchor="center", justify="center", wraplength=_wl,
-                      relief="solid", borderwidth=1).grid(
-                row=r, column=col, sticky="nsew", padx=1, pady=1)
-        for fr in (self._left_frame, self._grid_frame):
-            fr.rowconfigure(r, minsize=RESULT_ROW_H, weight=0)
-        # 新行插入后自动滚到最新一行，无需手动拖动上下滑块
-        self.after_idle(self._scroll_res_to_latest)
+        self._rows.append((list(wide_vals), list(fail_flags)))
+        self._grid_row = len(self._rows)
+        self._sync_scrollregion()
+        if getattr(self, "_auto_follow", True):
+            # 停在底部：跟随最新行
+            self._scroll_res_to_latest()
+        else:
+            # 用户正在上翻查看历史：只补画进入视口的行，不抢滚动位置
+            self._sync_visible_rows()
 
     def _clear_result_rows(self):
         """清空数据行（保留冻结表头与左列区结构）。"""
-        if not hasattr(self, "_grid_frame") or self._grid_frame is None:
+        if not hasattr(self, "_items"):
             return
-        for fr in (self._left_frame, self._grid_frame):
-            for w in fr.winfo_children():
-                w.destroy()
+        for ids in self._items.values():
+            for cv, iid in ids:
+                try:
+                    cv.delete(iid)
+                except Exception:
+                    pass
+        self._items.clear()
+        self._rows.clear()
         self._grid_row = 0
+        self._sync_scrollregion()
         self.after_idle(self._scroll_res_to_top)
 
     def _rebuild_result_columns(self, cfg):
@@ -6853,6 +10423,18 @@ class App(tk.Tk):
 
     # ---------------- 关闭 ----------------
     def _on_close(self):
+        if self.busy:
+            # 直接关窗口是唯一的中止方式：断点已在每个组合结束时落盘，这里只留痕，
+            # 让用户知道下次启动会自动接着测（而不是以为这轮白跑了）
+            try:
+                _st = read_checkpoint()
+                if _st:
+                    self.log("[断点续测] 测量中关闭工具：已完成 %d/%d 的断点已保存，"
+                             "下次启动会自动接着测" % (_st["done"], _st["total"]))
+                else:
+                    self.log("[断点续测] 测量中关闭工具：还没有完成的组合，无断点可续")
+            except Exception:
+                pass
         self.save_settings()
         self.disconnect()
         if self.run_log:
@@ -6908,6 +10490,24 @@ if __name__ == "__main__":
                 pass
             sys.exit(0 if _ok else 1)
         run_selftest()
+    elif "--loss-table" in sys.argv:
+        # 按粗粒度锚点重算 FDC 损耗表（1 位小数）；可带一个参数覆盖 2 GHz 损耗值
+        _i = sys.argv.index("--loss-table")
+        _ref = LOSS_MODEL_REF_DB
+        if len(sys.argv) > _i + 1:
+            try:
+                _ref = float(sys.argv[_i + 1])
+            except ValueError:
+                pass
+        print(recommend_loss_report(_ref))
+        if getattr(sys, "frozen", False):
+            # windowed exe 无控制台：把结果写到 exe 同目录，方便复制
+            try:
+                _p = os.path.join(APP_DIR, "freq_loss_segments.txt")
+                with open(_p, "w", encoding="utf-8") as _f:
+                    _f.write(recommend_loss_report(_ref) + "\n")
+            except Exception:
+                pass
     elif "--demo" in sys.argv:
         run_demo()
     else:
