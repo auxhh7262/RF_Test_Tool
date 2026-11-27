@@ -30,7 +30,7 @@ BLOCKED_EXACT = {
     "config.json", "selftest_result.txt", "upload_settings.json",
 }
 BLOCKED_PREFIX = (
-    "logs/", "result/", "state/", "dist/", "build/", ".venv", ".git/",
+    "logs/", "result/", "state/", "dist/", "build/", "temp/", ".venv", ".git/",
     ".workbuddy/",
 )
 BLOCKED_SUFFIX = (
@@ -157,7 +157,7 @@ class Uploader(tk.Tk):
 
         foot = ttk.Label(
             self,
-            text="仓库目录：%s    |    不上传 config.json / exe / logs / result / state / PDF / upload_settings.json"
+            text="仓库目录：%s    |    不上传 config.json / exe / logs / result / state / temp / PDF"
                  % ROOT,
             padding=(10, 6),
         )

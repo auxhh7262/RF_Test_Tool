@@ -9,6 +9,8 @@ __pycache__/
 .venv*/
 env/
 
+# ====== 临时文件统一目录（规则：所有中间产物/备份/一次性脚本进 temp/） ======
+temp/
 # ====== PyInstaller ======
 build/
 *.spec
@@ -19,7 +21,7 @@ build/
 /*.pdb
 # 旧的 dist 输出目录（已扁平化到根目录，此目录不再生成）
 dist/
-# 自检输出
+# 自检输出（新位置 temp/selftest_result.txt 已被 temp/ 覆盖；旧位置兼容）
 selftest_result.txt
 # 上传助手的本地代理设置（不上传）
 upload_settings.json

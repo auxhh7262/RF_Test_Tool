@@ -10,8 +10,11 @@ exit /b
 tasklist /FI "IMAGENAME eq CMW500_LTE_Tool.exe" 2>nul | find /I "CMW500_LTE_Tool.exe" >nul
 if not errorlevel 1 goto BUSY
 
+REM All intermediate files go to temp\ to keep the project root clean.
+if not exist temp mkdir temp
+
 echo [1/3] Building exe into project root ...
-".venv38\Scripts\pyinstaller.exe" --noconfirm --clean --distpath . CMW500_LTE_Tool.spec
+".venv38\Scripts\pyinstaller.exe" --noconfirm --clean --distpath . --workpath temp\build CMW500_LTE_Tool.spec
 if errorlevel 1 goto FAIL
 
 echo.
@@ -20,9 +23,9 @@ CMW500_LTE_Tool.exe --selftest
 if errorlevel 1 goto FAIL
 
 echo.
-echo [3/3] Removing build cache ...
-if exist build rmdir /s /q build
-if exist selftest_result.txt del /q selftest_result.txt
+echo [3/3] Removing build cache under temp\ ...
+if exist temp\build rmdir /s /q temp\build
+if exist temp\selftest_result.txt del /q temp\selftest_result.txt
 
 echo.
 echo Build OK: CMW500_LTE_Tool.exe in this folder.

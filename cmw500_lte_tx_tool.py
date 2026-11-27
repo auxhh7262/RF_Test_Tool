@@ -10645,8 +10645,14 @@ def main():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         if getattr(sys, "frozen", False):
-            # windowed exe 无控制台：把自检输出写到 exe 旁 selftest_result.txt
+            # windowed exe 无控制台：自检输出写到 temp/selftest_result.txt，
+            # 不落在根目录（根目录只保留必要文件，中间产物统一进 temp/）
             import io as _io
+            _tmpdir = os.path.join(APP_DIR, "temp")
+            try:
+                os.makedirs(_tmpdir, exist_ok=True)
+            except Exception:
+                pass
             _buf = _io.StringIO()
             _old = sys.stdout
             sys.stdout = _buf
@@ -10662,7 +10668,7 @@ if __name__ == "__main__":
             finally:
                 sys.stdout = _old
             try:
-                with open(os.path.join(APP_DIR, "selftest_result.txt"),
+                with open(os.path.join(_tmpdir, "selftest_result.txt"),
                           "w", encoding="utf-8") as _f:
                     _f.write(_buf.getvalue() or
                              ("selftest %s" % ("OK" if _ok else "FAIL")))
