@@ -1450,6 +1450,19 @@ def default_bw_for_band(band):
                                    -BW_TO_MHZ[w]))
 
 
+def min_bw_for_band(band):
+    """该频段支持的最小带宽（「最小带宽」批量按钮用）。
+
+    与 default_bw_for_band（默认 10MHz）不同：这里按带宽数值取最小的一个，
+    例如 B1 支持 5/10/15/20MHz → 5MHz；B2 支持 1.4/3/5/10/15/20MHz → 1.4MHz。
+    带宽表缺失或无合法带宽时返回 None，调用方按「全清」处理。
+    """
+    sup = band_supported_bws(band)
+    if not sup:
+        return None
+    return min(sup, key=lambda w: BW_TO_MHZ[w])
+
+
 def normalize_band_bws(cfg):
     """把配置规范成 {band: [bw, ...]}，每个频段只保留它支持的带宽。
 
@@ -6678,6 +6691,32 @@ def run_selftest():
     assert not any(c[0] == "OB1" and c[1] == "B014" for c in cmb)
     assert "B1: 10MHz" in band_bws_summary(["OB1", "OB2"], sel), \
         band_bws_summary(["OB1", "OB2"], sel)
+    # 「最小带宽」批量按钮：按带宽数值取最小，不是默认 10MHz
+    assert min_bw_for_band("OB1") == "B050", min_bw_for_band("OB1")
+    assert min_bw_for_band("OB2") == "B014", min_bw_for_band("OB2")
+    assert min_bw_for_band("OB999") is None
+
+    class _FakeVar(object):
+        def __init__(self, v=False):
+            self.v = v
+        def get(self):
+            return self.v
+        def set(self, v):
+            self.v = v
+
+    _fake = App.__new__(App)
+    _picked = ("OB1", "OB2")
+    _fake.band_vars = {b: _FakeVar(b in _picked) for b in ALL_BANDS}
+    _fake.band_bw_vars = {b: {w: _FakeVar(w == "B100") for w in BW_CHOICES}
+                          for b in ALL_BANDS}
+    _fake._refresh_band_bw_summary = lambda: None
+    _fake._set_status = lambda msg: None
+    App._bulk_band_bws_min(_fake)
+    for _b in _picked:
+        _m = min_bw_for_band(_b)
+        assert _fake.band_bw_vars[_b][_m].get(), (_b, _m)
+        assert sum(v.get() for v in _fake.band_bw_vars[_b].values()) == 1
+    assert _fake.band_bw_vars["OB6"]["B100"].get()  # 未勾选频段保持原样
     # 全信道扫描：B1/10MHz 合法 DL EARFCN = 50..550（501 个），首尾与三点表一致
     _all = all_band_channels("OB1", "B100")
     assert len(_all) == 501 and _all[0] == ("全", 50) and _all[-1] == ("全", 550), \
@@ -7142,13 +7181,15 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    - 【批量】先勾选多个频段，再点表头某个带宽的复选框，即可让这些频段
      一次性全部选上（或全部取消）该带宽，无需逐行点选；只作用于已勾选
      且支持该带宽的频段，灰色表头表示当前没有可作用的频段。
-     两个按钮可批量「已选频段全选带宽 / 清空全部选择」；后者会同时
-     取消已勾选的频段与全部带宽，一键恢复空白选择状态。
+     三个按钮可批量「最小带宽 / 已选频段全选带宽 / 清空全部选择」；
+     「最小带宽」把已勾选频段各自改为最小支持带宽（如 B1 取 5MHz、B2 取 1.4MHz），
+     清掉这些频段原先勾选的其它带宽；未勾选频段不受影响。
+     「清空」会同时取消已勾选的频段与全部带宽，一键恢复空白选择状态。
    - 勾选某频段时默认【只勾 10MHz】（不再是自动全选所有支持带宽）；
      不支持 10MHz 的频段（B31/B51/B54/B72/B73/B87/B88/B106）默认勾
      最接近的支持带宽（5MHz 或 3MHz）并在状态栏提示。
-     已手动勾过带宽的频段保持原样；想恢复默认可先点「清空全部选择」再重勾，
-     「已选频段全选带宽」按钮仍可一次全选全部支持带宽。
+     已手动勾过带宽的频段保持原样；想恢复默认可先点「清空」再重勾，
+     「最小带宽」/「全选带宽」按钮可一次批量改写已勾选频段。
      表格可滚动，鼠标悬停频段名可查看支持的带宽与三个信道；
      顶部汇总实时显示 已选频段数 / 频段-带宽组合数 / 实际测试点数。
    - 低/中/高信道按当前带宽内缩 B/2（TS 36.101 5.7.3），保证整条
@@ -7977,6 +8018,9 @@ class App(tk.Tk):
         bar.pack(fill="x", pady=(0, 4))
         ttk.Label(bar, text="① 工作频段与带宽",
                   font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=(2, 12))
+        ttk.Button(bar, text="最小带宽", width=8,
+                   command=self._bulk_band_bws_min).pack(
+                       side="left", padx=(0, 6))
         ttk.Button(bar, text="全选带宽", width=8,
                    command=lambda: self._bulk_band_bws(True)).pack(
                        side="left", padx=(0, 6))
@@ -7989,9 +8033,10 @@ class App(tk.Tk):
         hint = ttk.Frame(box)
         hint.pack(fill="x", pady=(0, 4))
         ttk.Label(hint,
-                  text="批量：先勾选多个频段，再点表头带宽复选框 → 一次性全选/取消该带宽；"
+                  text="批量：先勾选多个频段，点【最小带宽】各自只勾最小支持带宽，"
+                       "或点表头带宽复选框一次性全选/取消该带宽；"
                        "勾选频段默认只勾 10MHz（不支持则取最接近的）；"
-                       "「清空全部选择」会连已勾选频段一起取消；"
+                       "【清空】会连已勾选频段一起取消；"
                        "灰色表头 = 当前无可作用频段。",
                   foreground="#4a9eda").pack(side="left")
 
@@ -8121,6 +8166,24 @@ class App(tk.Tk):
             for w in BW_CHOICES:
                 self.band_bw_vars[b][w].set(w in supported)
         self._refresh_band_bw_summary()
+
+    def _bulk_band_bws_min(self):
+        """「最小带宽」：已勾选频段各自只勾最小支持带宽，清掉其它已勾带宽。
+
+        只作用于已勾选的频段；未勾选频段保持原样（即使有手工残留也不动），
+        与「清空」按钮的语义区分开。每个频段的最小带宽取自 min_bw_for_band()。
+        """
+        n = 0
+        for b in ALL_BANDS:
+            if not self.band_vars[b].get():
+                continue
+            w = min_bw_for_band(b)
+            for cw in BW_CHOICES:
+                self.band_bw_vars[b][cw].set(cw == w)
+            if w:
+                n += 1
+        self._refresh_band_bw_summary()
+        self._set_status("最小带宽：%d 个已勾选频段改为各自最小支持带宽" % n)
 
     def _clear_all_selection(self):
         """清空全部选择：取消所有已勾选的频段，并清空所有频段的带宽勾选。
