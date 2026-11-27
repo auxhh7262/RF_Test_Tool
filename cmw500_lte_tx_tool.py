@@ -7969,11 +7969,13 @@ class App(tk.Tk):
         metrics_row.pack(fill="x")
 
         # ① 测试信道（TX/RX 公用）：三种信道集互斥，对所有已勾选指标生效
+        # padding 竖向取 2：勾选框比上方设置行的 Combobox 高 8px，配合 pady=2
+        # 让本框外框高度 58 与「终测仪/电源/AT」三个设置框完全一致
         bf_ch = ttk.LabelFrame(metrics_row, text="① 测试信道（TX/RX 通用）",
-                               padding=(8, 5))
+                               padding=(8, 2))
         bf_ch.pack(side="left", fill="y", padx=(0, 8))
         cframe = ttk.Frame(bf_ch)
-        cframe.pack(fill="x")
+        cframe.pack(fill="x", expand=True)
         self.three_scan_cb = ttk.Checkbutton(
             cframe, text="三信道", variable=self.three_scan_var,
             command=self._on_three_scan_toggle)
@@ -7989,16 +7991,18 @@ class App(tk.Tk):
             command=self._on_range_scan_toggle)
         self.range_scan_cb.grid(row=0, column=2, sticky="w", padx=(2, 10), pady=3)
         _attach_range_scan_tip(self.range_scan_cb)
-        ttk.Button(cframe, text="设置范围", width=9,
+        # 用 Inline.TButton（padding=(6,0)）：与上方设置行的【检测/发送】同款，
+        # 高度与勾选框一致；默认 TButton 会把这一行撑到 39px，整框比上面高出一截
+        ttk.Button(cframe, text="设置范围", width=9, style="Inline.TButton",
                    command=self._open_channel_range_dialog).grid(
                        row=0, column=3, sticky="w", padx=(2, 6), pady=3)
 
         # ② 测试场景（TX/RX 公用）：选 Pmax / Pmin / Pmax+Pmin 后再勾指标，
         #    所有勾选的 TX/RX 指标都在所选场景下测量，结果列带档位标注。
-        bf_scenario = ttk.LabelFrame(metrics_row, text="② 测试场景", padding=(8, 5))
+        bf_scenario = ttk.LabelFrame(metrics_row, text="② 测试场景", padding=(8, 2))
         bf_scenario.pack(side="left", fill="y", padx=(0, 8))
         sframe = ttk.Frame(bf_scenario)
-        sframe.pack(fill="x")
+        sframe.pack(fill="x", expand=True)
         for j, mode in enumerate(SENS_POWER_MODES):
             ttk.Radiobutton(sframe, text=SENS_POWER_LABELS[mode], value=mode,
                             variable=self.sens_power_mode_var,
@@ -8018,10 +8022,10 @@ class App(tk.Tk):
                     "仅在测试场景选 Pmin 或 Pmax+Pmin 时生效。")
 
         # ③ TX 指标（按测试场景的功率档测上行）—— 勾选哪些就测哪些
-        bf_tx = ttk.LabelFrame(metrics_row, text="③ TX 指标", padding=(8, 5))
+        bf_tx = ttk.LabelFrame(metrics_row, text="③ TX 指标", padding=(8, 2))
         bf_tx.pack(side="left", fill="y", padx=(0, 8))
         mframe = ttk.Frame(bf_tx)
-        mframe.pack(fill="x")
+        mframe.pack(fill="x", expand=True)
         for i, k in enumerate(TX_METRIC_KEYS):
             ttk.Checkbutton(mframe, text=METRIC_LABELS[k],
                             variable=self.metric_vars[k],
@@ -8029,10 +8033,10 @@ class App(tk.Tk):
                 row=0, column=i, sticky="w", padx=(2, 14), pady=3)
 
         # ④ RX 指标：只保留独立的灵敏度开关；信道集由上面的公共设置决定
-        bf_rx = ttk.LabelFrame(metrics_row, text="④ RX 指标", padding=(8, 5))
+        bf_rx = ttk.LabelFrame(metrics_row, text="④ RX 指标", padding=(8, 2))
         bf_rx.pack(side="left", fill="y")
         rframe = ttk.Frame(bf_rx)
-        rframe.pack(fill="x")
+        rframe.pack(fill="x", expand=True)
         self.sensitivity_cb = ttk.Checkbutton(
             rframe, text=METRIC_LABELS["sensitivity"],
             variable=self.metric_vars["sensitivity"],
@@ -8041,6 +8045,8 @@ class App(tk.Tk):
         _attach_sensitivity_tip(self.sensitivity_cb)
         # 外部衰减（旧版手动输入框已移除，改用 freq_loss_segments 按频段/信道
         # 自动插值补偿 EATT:OUTP/EATT:INP，见 retune_cell + else 快速路径）
+
+        # ①②③④ 四个框不再显示（高度靠自身 padding 与上方设置框对齐）
 
         # 高级参数不再显示，使用 config.json / 默认值
 
