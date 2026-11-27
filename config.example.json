@@ -16,7 +16,7 @@
   "_comment_rx_path_ports": "RF口结构化配置: rx=[上行连接器,转换器]; tx=[[下行连接器,转换器],...] (prx/drx 1路, prx_drx 2路); 连接器 RF1C/RF2C/RF3C/RF4C/RFAC/RFBC, 转换器 TXn/RX1/RX2; 改完保存后工具自动刷新下拉, 测量中不刷新",
   "rx_path": "prx",
   "rf_port_combo": "RF1+RF2",
-  "_comment_rf_port_combo": "RF口组合，换口只改这一行: RF1+RF2 = RF1COM主集/RF2COM分集(TX1,TX3,RX1); RF3+RF4 = RF3COM主集/RF4COM分集(TX2,TX4,RX2)。选中后 PRX/DRX/PRX+DRX 三种模式的路由与FDC校准口自动展开，rx_path_ports 由它覆盖；留空则用 rx_path_ports 手写端口（自定义接法）。",
+  "_comment_rf_port_combo": "RF口组合，换口只改这一行: RF1+RF2 = RF1COM主集/RF2COM分集(TX1,TX3,RX1); RF3+RF4 = RF3COM主集/RF4COM分集(TX2,TX4,RX2); RF1+RF3 = RF1COM主集/RF3COM分集(TX1,TX2,RX1，DRX 也用 TX2)。选中后 PRX/DRX/PRX+DRX 三种模式的路由与FDC校准口自动展开，rx_path_ports 由它覆盖；留空则用 rx_path_ports 手写端口（自定义接法）。",
   "rx_path_ports": {
     "prx": {
       "scenario": "SCEL",
