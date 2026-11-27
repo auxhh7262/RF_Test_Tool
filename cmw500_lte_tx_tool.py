@@ -9171,6 +9171,14 @@ class App(tk.Tk):
             scpi = self._connect_scpi()
             psu = self._connect_psu()
 
+            # 先给 DUT 上电，再打开小区：UE 必须在信号发出前已开机，才有机会
+            # 搜网并注册。旧流程在 UE 注册后才供电，UE 没注册时直接抛错，
+            # 日志里一条 [PSU] 命令都看不到（真机 170658/170710/170923.log）。
+            if psu:
+                for cmd in build_psu_voltage_commands(cfg):
+                    psu.write(cmd)
+                    self.log("[PSU] " + cmd)
+
             cmds, meta = build_signaling_init(cfg, band, bw)
             for cmd in cmds:
                 scpi.write(cmd)
@@ -9194,11 +9202,6 @@ class App(tk.Tk):
                     "UE 未注册到小区（PSW:STAT=%s）。测量已中止。\n"
                     "可能原因：DUT 未开机/未进入测试模式、DL 信号功率不足、"
                     "频段与 UE 不匹配、鉴权/安全设置不一致。" % st)
-
-            if psu:
-                for cmd in build_psu_voltage_commands(cfg):
-                    psu.write(cmd)
-                    self.log("[PSU] " + cmd)
 
             self.msg_queue.put(("init_done", "仪表初始化完成（小区 ON,ADJ，UE 已注册）"))
         except LinkError as exc:
