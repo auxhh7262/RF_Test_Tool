@@ -7875,11 +7875,10 @@ class App(tk.Tk):
         self._on_psu_enable_change()  # 按勾选状态刷新电源控件可用状态
         self._apply_link_mode("psu")  # 按初始接口刷新板号/地址框状态与提示
 
-        # 参数配置 / 频段参数：右侧每行一个，sticky="nse" 让按钮撑满该行
-        # （行高由左侧 LabelFrame 的 58px 决定，pady=(0,4) 与左侧框的下间距一致），
-        # 按钮上下边界与「终测仪设置 / 电源设置」框严格齐平
+        # 参数配置 / 频段参数：右侧每行一个，sticky="se" 只贴右下角，
+        # 保持按钮自身常规高度（不拉伸填满 58px 行高），底端与同行设置框底端齐平
         self.btn_open_cfg = ttk.Button(set_row, text="参数配置", command=self._open_config, width=12)
-        self.btn_open_cfg.grid(row=0, column=1, sticky="nse", padx=(10, 2), pady=(0, 4))
+        self.btn_open_cfg.grid(row=0, column=1, sticky="se", padx=(10, 2), pady=(0, 4))
         _attach_tip(self.btn_open_cfg,
                     "打开 config.json（系统默认编辑器），保存后界面自动同步：\n"
                     "• cmw_link / psu_link：接口下拉 LAN | GPIB\n"
@@ -7905,7 +7904,7 @@ class App(tk.Tk):
                     "• eatt：外部衰减（dB）；init_popup_ms：提示框停留时长\n"
                     "• 测量进行中不刷新配置，结束或下次初始化时生效")
         self.btn_open_specs = ttk.Button(set_row, text="频段参数", command=self._open_specs, width=12)
-        self.btn_open_specs.grid(row=1, column=1, sticky="nse", padx=(10, 2), pady=(0, 4))
+        self.btn_open_specs.grid(row=1, column=1, sticky="se", padx=(10, 2), pady=(0, 4))
         _attach_tip(self.btn_open_specs,
                     "打开 specs 目录（bands / ul_cfg / refsens / lte_channels）：\n"
                     "• 频段表、UL 配置、参考灵敏度均按 3GPP R19 快照配置，默认无需修改\n"
@@ -7948,15 +7947,15 @@ class App(tk.Tk):
         self.btn_at_send = ttk.Button(f_at, text="发送", width=5, style="Inline.TButton",
                                       command=self._send_at_cmd)
         self.btn_at_send.grid(row=0, column=5, sticky="w", padx=(4, 2))
-        # 操作按钮：初始化仪表 → 开始测量；sticky="nse" 撑满该行，
-        # 两个按钮各 fill="y" → 高度与「AT 控制」框一致（58px）且同一水平线
+        # 操作按钮：初始化仪表 → 开始测量；容器 sticky="se" 贴右下角，
+        # 按钮不 fill="y" → 常规高度、同一水平线，底端与「AT 控制」框底端齐平
         fbtn = ttk.Frame(set_row)
-        fbtn.grid(row=2, column=1, sticky="nse", padx=(10, 2), pady=(0, 4))
+        fbtn.grid(row=2, column=1, sticky="se", padx=(10, 2), pady=(0, 4))
         self.btn_init = ttk.Button(fbtn, text="初始化仪表", command=self.initialize, width=12)
-        self.btn_init.pack(side="left", fill="y", padx=(0, 4))
+        self.btn_init.pack(side="left", padx=(0, 4))
         self.btn_measure = ttk.Button(fbtn, text="开始测量", command=self.start_measurement,
                                       width=12)
-        self.btn_measure.pack(side="left", fill="y")
+        self.btn_measure.pack(side="left")
 
         # ===== 中间：频段 → 带宽 → 指标，自上而下依次分布 =====
         mid = ttk.Frame(root)
@@ -8150,23 +8149,21 @@ class App(tk.Tk):
         box = ttk.LabelFrame(parent, text="", padding=(8, 5))
         box.pack(fill="x", pady=(0, 5))
 
-        # 标题与批量按钮同一行：行高固定 58px（与上方「终测仪/电源/AT」设置框同高），
-        # 三个按钮 fill="y" 撑满该行，上/下边界与同高度的框齐平
-        bar = ttk.Frame(box, height=58)
+        # 标题与批量按钮同一行：三个批量按钮保持与右侧 4 个按钮相同的常规高度，
+        # 行高由按钮自身高度决定（不再锁死 58px 拉伸）
+        bar = ttk.Frame(box)
         bar.pack(fill="x", pady=(0, 4))
-        # 只锁高度：宽度由 fill="x" 拉满，不受传播开关影响
-        bar.pack_propagate(False)
         ttk.Label(bar, text="① 工作频段与带宽",
                   font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=(2, 12))
         ttk.Button(bar, text="最小带宽", width=8,
                    command=self._bulk_band_bws_min).pack(
-                       side="left", fill="y", padx=(0, 6))
+                       side="left", padx=(0, 6))
         ttk.Button(bar, text="全选带宽", width=8,
                    command=lambda: self._bulk_band_bws(True)).pack(
-                       side="left", fill="y", padx=(0, 6))
+                       side="left", padx=(0, 6))
         ttk.Button(bar, text="清空", width=8,
                    command=self._clear_all_selection).pack(
-                       side="left", fill="y", padx=(0, 6))
+                       side="left", padx=(0, 6))
         ttk.Label(bar, textvariable=self.band_bw_summary_var,
                   foreground="#2e7d32", anchor="e").pack(side="right")
 
