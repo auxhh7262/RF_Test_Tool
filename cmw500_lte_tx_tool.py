@@ -6765,6 +6765,7 @@ def run_selftest():
                           for b in ALL_BANDS}
     _fake._refresh_band_bw_summary = lambda: None
     _fake._set_status = lambda msg: None
+    _fake._on_metrics_change = lambda: None
     App._bulk_band_bws_min(_fake)
     for _b in _picked:
         _m = min_bw_for_band(_b)
@@ -6797,6 +6798,20 @@ def run_selftest():
     assert band_points_count("OB1", "B100", True) == 501
     assert band_points_count("OB1", "B100", True) == len(_cmb_full)
     assert CONFIG_DEFAULTS["full_scan"] is False
+    # RX 三模式互斥：选中任意一个都清掉另两项且保持 sensitivity=True
+    _fake.metric_vars = {"sensitivity": _FakeVar(False)}
+    _fake.full_scan_var, _fake.range_scan_var = _FakeVar(False), _FakeVar(False)
+    for _m, _chk in (("three", lambda: not _fake.full_scan_var.get()
+                      and not _fake.range_scan_var.get()),
+                     ("full", lambda: _fake.full_scan_var.get()
+                      and not _fake.range_scan_var.get()),
+                     ("range", lambda: _fake.range_scan_var.get()
+                      and not _fake.full_scan_var.get())):
+        App._set_rx_mode(_fake, _m)
+        assert _fake.metric_vars["sensitivity"].get() and _chk(), _m
+    App._set_rx_mode(_fake, "none")
+    assert not _fake.metric_vars["sensitivity"].get() \
+        and not _fake.full_scan_var.get() and not _fake.range_scan_var.get()
     # 宽表：一行一个组合，指标按列（UL RB+sens_limit 已移到 TX 指标后、灵敏度前）
     _metrics_all = {"sensitivity": True, "maxpower": True, "aclr": True, "evm": True,
                    "freqerr": True, "psu_enable": True}
@@ -7237,16 +7252,16 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
      specs\LTE\bands.json（RF Band Tool / 3GPP R19 的本地快照，随工具一同复制）。
      工具运行与刷新只读本目录，不访问任何外部路径；该文件缺失时回退
      lte_channels.json 全量快照，再回退内置兜底表。
-   - 测试信道范围（RX 指标框，与指标勾选解耦）：默认每个 (频段,带宽) 只测
-     低/中/高三点。三种模式：
+   - RX 指标框三种灵敏度模式互斥，一次只能选中一个：
+     • 【三信道灵敏度】每个 (频段,带宽) 只测低/中/高三点；
      • 【全信道灵敏度】按 TS 36.101 口径枚举该带宽下全部合法 DL EARFCN
        （离频段边缘 ≥ B/2）。例如 B1/10MHz = CH50~550 共 501 点，
        耗时约为三信道的 167 倍，仅用于全面摸底；
-     • 【自定义信道范围】与全信道互斥。勾选后点【设置范围】，为每个已勾选的
+     • 【自定义信道范围】勾选后点【设置范围】，为每个已勾选的
        频段×带宽填首末 DL EARFCN，范围内的合法信道全部测；未设置的组合
        回退到默认三信道；
-     • 两者都不勾：默认低/中/高三点。
-     信道集对所有已勾选指标生效，不再依赖灵敏度是否勾选。
+     • 三者都不勾：不测灵敏度，只测 TX 指标。
+     信道集对所有已勾选指标生效；互斥切换由界面保证。
      运行 python refresh_lte_channels.py 可刷新快照与对照表。
      鼠标悬停频段复选框可查看该频段支持的带宽与三个信道。
    - 每个频段可独立选择不同带宽（例如 B1 只测 10MHz，B2 测 1.4/5/20MHz），
@@ -7431,19 +7446,19 @@ def _attach_full_scan_tip(widget):
                 "全信道灵敏度（测试信道范围）\n"
                 "勾选后：每个已勾选频段×带宽，按 3GPP TS 36.101 口径枚举\n"
                 "该带宽下全部合法 DL EARFCN（含低/中/高之间所有信道），\n"
-                "所有勾选的指标都按这些信道逐点测。与灵敏度是否勾选无关。\n"
+                "对所有已勾选指标生效。与另外两项互斥，一次只能选一个。\n"
                 "信道数远多于默认 3 点，耗时显著增加。\n"
-                "未勾选：保持默认低/中/高三信道（或自定义信道范围）。")
+                "取消勾选：回到不测灵敏度（三者全清）。")
 
 
 def _attach_range_scan_tip(widget):
     """自定义信道范围复选框悬停提示。"""
     _attach_tip(widget,
                 "自定义信道范围（测试信道）\n"
-                "与【全信道灵敏度】互斥。勾选后，点【设置范围】为每个已勾选的\n"
-                "频段×带宽分别填首/末 DL EARFCN，该范围内的合法信道全部测。\n"
-                "所有勾选的指标都按这些信道测，与灵敏度是否勾选无关。\n"
-                "未设置范围的频段×带宽回退到默认低/中/高三点。")
+                "与另外两项互斥，一次只能选一个。勾选后点【设置范围】，\n"
+                "为每个已勾选频段×带宽分别填首/末 DL EARFCN，范围内合法信道全部测。\n"
+                "对所有已勾选指标生效；未设置范围的组合回退到默认低/中/高三点。\n"
+                "取消勾选：回到不测灵敏度（三者全清）。")
 
 
 def _attach_sensitivity_tip(widget):
@@ -7455,8 +7470,8 @@ def _attach_sensitivity_tip(widget):
                 "• 三级步进：粗扫 → 中步 → 精扫 0.1dB，兼顾速度与精度\n"
                 "• 同频段带宽相邻信道复用热点结果，减少重复扫描\n"
                 "• 每信道需多轮 BLER 测量，耗时较长\n"
-                "「三信道」指默认信道集；勾选【全信道灵敏度】或【自定义信道范围】后，\n"
-                "灵敏度按对应信道集逐点测。未勾选：只测 TX 指标。")
+                "三者互斥，一次只能选一个；另两项分别是全信道与自定义范围。\n"
+                "取消勾选：三者全清，只测 TX 指标。")
 
 
 LOG_BOX_LINES = 15    # 底部运行日志区可见行数（右侧带滚动条可回看历史）
@@ -7632,9 +7647,14 @@ class App(tk.Tk):
             _mode = "high"
         self.sens_power_mode_var = tk.StringVar(value=_mode)
         self.sens_low_power_var = V("sens_low_power")
-        # 测试信道范围：全信道扫描 / 自定义首末信道 二选一，与灵敏度指标解耦
-        self.full_scan_var = tk.BooleanVar(value=bool(c.get("full_scan", False)))
-        self.range_scan_var = tk.BooleanVar(value=bool(c.get("range_scan", False)))
+        # RX 三种灵敏度模式互斥：三信道 / 全信道 / 自定义范围（三选一）。
+        # 旧配置可能同时勾多项，按 自定义 > 全信道 > 三信道 归一化，避免界面多选。
+        _rx_init = ("range" if c.get("range_scan") else
+                    "full" if c.get("full_scan") else
+                    "three" if bool(c["metrics"].get("sensitivity", True)) else "none")
+        self.metric_vars["sensitivity"].set(_rx_init != "none")
+        self.full_scan_var = tk.BooleanVar(value=(_rx_init == "full"))
+        self.range_scan_var = tk.BooleanVar(value=(_rx_init == "range"))
         self.channel_ranges = normalize_channel_ranges(c.get("channel_ranges"))
 
         # AT 控制行：串口选择（空/auto=自动识别）+ 手动 debug 指令输入
@@ -7992,7 +8012,7 @@ class App(tk.Tk):
         self.sensitivity_cb = ttk.Checkbutton(
             rframe, text=METRIC_LABELS["sensitivity"],
             variable=self.metric_vars["sensitivity"],
-            command=self._on_metrics_change)
+            command=self._on_sensitivity_toggle)
         self.sensitivity_cb.grid(row=0, column=0, sticky="w", padx=(2, 10), pady=3)
         _attach_sensitivity_tip(self.sensitivity_cb)
         self.full_scan_cb = ttk.Checkbutton(
@@ -8298,20 +8318,35 @@ class App(tk.Tk):
         self._refresh_band_bw_summary()
         self._set_status("已清空全部选择：取消 %d 个频段及全部带宽勾选" % n_bands)
 
-    def _on_full_scan_toggle(self):
-        """全信道扫描开关：与自定义范围互斥，立刻重算顶部测试点数。"""
-        if self.full_scan_var.get() and self.range_scan_var.get():
-            self.range_scan_var.set(False)
+    def _set_rx_mode(self, mode):
+        """RX 三模式互斥：three / full / range / none。
+
+        三者都是灵敏度测试的不同信道集，选中任意一个都必须保持
+        sensitivity=True（否则结果表不出灵敏度列）；取消当前项则
+        三者全清，回到不测灵敏度。
+        """
+        self.metric_vars["sensitivity"].set(mode != "none")
+        self.full_scan_var.set(mode == "full")
+        self.range_scan_var.set(mode == "range")
         self._refresh_band_bw_summary()
+        self._on_metrics_change()
+
+    def _on_sensitivity_toggle(self):
+        """三信道灵敏度：勾上则清掉另两项，取消则三者全清。"""
+        self._set_rx_mode("three" if self.metric_vars["sensitivity"].get() else "none")
+
+    def _on_full_scan_toggle(self):
+        """全信道灵敏度：勾上则清掉另两项，取消则三者全清。"""
         if self.full_scan_var.get():
+            self._set_rx_mode("full")
             self._set_status("全信道灵敏度已开启：测试点数按全部合法信道计算，耗时显著增加")
+        else:
+            self._set_rx_mode("none")
 
     def _on_range_scan_toggle(self):
-        """自定义信道范围开关：与全信道扫描互斥，提示是否已设置范围。"""
-        if self.range_scan_var.get() and self.full_scan_var.get():
-            self.full_scan_var.set(False)
-        self._refresh_band_bw_summary()
+        """自定义信道范围：勾上则清掉另两项，取消则三者全清。"""
         if self.range_scan_var.get():
+            self._set_rx_mode("range")
             n = sum(1 for b in ALL_BANDS if self.band_vars[b].get()
                     for w in BW_CHOICES
                     if w in band_supported_bws(b)
@@ -8319,6 +8354,8 @@ class App(tk.Tk):
                     and w in (self.channel_ranges.get(b) or {}))
             self._set_status("自定义信道范围已开启：%d 个频段×带宽已设范围%s" %
                              (n, "" if n else "，请点【设置范围】填写首末信道"))
+        else:
+            self._set_rx_mode("none")
 
     def _open_channel_range_dialog(self):
         """弹窗为每个已勾选 (频段,带宽) 设置首末 DL EARFCN。
@@ -8460,6 +8497,20 @@ class App(tk.Tk):
                    self.channel_ranges.update(orig), win.destroy())).pack(side="right")
         ttk.Button(row3, text="确定", command=lambda: (
             self._refresh_band_bw_summary(), win.destroy())).pack(side="right", padx=(0, 6))
+        # 弹窗中心对齐主窗口中心（上下左右都居中），不依赖窗口管理器默认位置。
+        # geometry 的 +x+y 定位窗口外框，winfo_root* 给的是客户区；Windows 上
+        # 标题栏/边框会带来十几到几十像素偏差，故按实测残差再校正一次。
+        win.update_idletasks()
+        tx = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        ty = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry("+%d+%d" % (max(0, tx), max(0, ty)))
+        win.update_idletasks()
+        dx = (self.winfo_rootx() + self.winfo_width() / 2.0) - \
+             (win.winfo_rootx() + win.winfo_width() / 2.0)
+        dy = (self.winfo_rooty() + self.winfo_height() / 2.0) - \
+             (win.winfo_rooty() + win.winfo_height() / 2.0)
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            win.geometry("+%d+%d" % (max(0, int(tx + dx)), max(0, int(ty + dy))))
         win.grab_set()
 
     def _refresh_band_bw_summary(self):
