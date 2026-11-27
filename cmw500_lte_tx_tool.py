@@ -7688,6 +7688,10 @@ class App(tk.Tk):
         # 行内小按钮（检测/发送）：压缩内边距使按钮高度与 Combobox/Entry 一致（23px），
         # 避免 AT 行被按钮撑高，三个设置框才能同高
         style.configure("Inline.TButton", padding=(6, 0))
+        # 标准操作按钮（参数配置/频段参数/初始化仪表/开始测量/最小带宽/全选带宽/清空）：
+        # clam 下默认 TButton padding=(8,5) 高度 33px；这里竖向加到 6 → 恰好 35px，
+        # 7 个按钮统一 35px 高（用户指定），底端与同行设置框底端齐平
+        style.configure("Bar.TButton", padding=(8, 6))
         # 下拉框统一白底：clam 主题下 readonly 状态的 fieldbackground 是 #dcdad5（灰），
         # 看起来像被禁用，与可编辑下拉/输入框（白底）不一致。仪表、接收模式、电源、
         # 通道、AT 口全部是只读下拉，这里统一成白底黑字（含获得焦点时，避免整格变深蓝）。
@@ -7877,7 +7881,8 @@ class App(tk.Tk):
 
         # 参数配置 / 频段参数：右侧每行一个，sticky="se" 只贴右下角，
         # 保持按钮自身常规高度（不拉伸填满 58px 行高），底端与同行设置框底端齐平
-        self.btn_open_cfg = ttk.Button(set_row, text="参数配置", command=self._open_config, width=12)
+        self.btn_open_cfg = ttk.Button(set_row, text="参数配置", command=self._open_config,
+                                       width=12, style="Bar.TButton")
         self.btn_open_cfg.grid(row=0, column=1, sticky="se", padx=(10, 2), pady=(0, 4))
         _attach_tip(self.btn_open_cfg,
                     "打开 config.json（系统默认编辑器），保存后界面自动同步：\n"
@@ -7903,7 +7908,8 @@ class App(tk.Tk):
                     "  实测 2 GHz 损耗 X dB → 用 --loss-table X 重算整表后替换本行\n"
                     "• eatt：外部衰减（dB）；init_popup_ms：提示框停留时长\n"
                     "• 测量进行中不刷新配置，结束或下次初始化时生效")
-        self.btn_open_specs = ttk.Button(set_row, text="频段参数", command=self._open_specs, width=12)
+        self.btn_open_specs = ttk.Button(set_row, text="频段参数", command=self._open_specs,
+                                         width=12, style="Bar.TButton")
         self.btn_open_specs.grid(row=1, column=1, sticky="se", padx=(10, 2), pady=(0, 4))
         _attach_tip(self.btn_open_specs,
                     "打开 specs 目录（bands / ul_cfg / refsens / lte_channels）：\n"
@@ -7951,10 +7957,11 @@ class App(tk.Tk):
         # 按钮不 fill="y" → 常规高度、同一水平线，底端与「AT 控制」框底端齐平
         fbtn = ttk.Frame(set_row)
         fbtn.grid(row=2, column=1, sticky="se", padx=(10, 2), pady=(0, 4))
-        self.btn_init = ttk.Button(fbtn, text="初始化仪表", command=self.initialize, width=12)
+        self.btn_init = ttk.Button(fbtn, text="初始化仪表", command=self.initialize,
+                                   width=12, style="Bar.TButton")
         self.btn_init.pack(side="left", padx=(0, 4))
         self.btn_measure = ttk.Button(fbtn, text="开始测量", command=self.start_measurement,
-                                      width=12)
+                                      width=12, style="Bar.TButton")
         self.btn_measure.pack(side="left")
 
         # ===== 中间：频段 → 带宽 → 指标，自上而下依次分布 =====
@@ -8155,13 +8162,13 @@ class App(tk.Tk):
         bar.pack(fill="x", pady=(0, 4))
         ttk.Label(bar, text="① 工作频段与带宽",
                   font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=(2, 12))
-        ttk.Button(bar, text="最小带宽", width=8,
+        ttk.Button(bar, text="最小带宽", width=8, style="Bar.TButton",
                    command=self._bulk_band_bws_min).pack(
                        side="left", padx=(0, 6))
-        ttk.Button(bar, text="全选带宽", width=8,
+        ttk.Button(bar, text="全选带宽", width=8, style="Bar.TButton",
                    command=lambda: self._bulk_band_bws(True)).pack(
                        side="left", padx=(0, 6))
-        ttk.Button(bar, text="清空", width=8,
+        ttk.Button(bar, text="清空", width=8, style="Bar.TButton",
                    command=self._clear_all_selection).pack(
                        side="left", padx=(0, 6))
         ttk.Label(bar, textvariable=self.band_bw_summary_var,
