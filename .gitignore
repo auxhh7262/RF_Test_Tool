@@ -12,6 +12,7 @@ env/
 # ====== PyInstaller ======
 build/
 *.spec
+!CMW500_LTE_Tool.spec
 !*.keep
 # 打包产物单文件 9.5M，入库会让 .git 每次提交涨 9.5M，不入库
 /*.exe
@@ -25,6 +26,9 @@ selftest_result.txt
 logs/
 result/
 state/
+
+# 本地实跑配置含仪表真实 IP / GPIB 地址，不上传；只上传 config.example.json
+config.json
 
 # ====== IDE / 插件 ======
 .vscode/

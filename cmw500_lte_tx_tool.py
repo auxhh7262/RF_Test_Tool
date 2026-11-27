@@ -1999,6 +1999,8 @@ CONFIG_DEFAULTS = {
     "cmw_gpib_board": 0,
     "cmw_gpib_addr": "20",      # CMW500 出厂 GPIB 主地址，切到 GPIB 自动回填
     "rf": "RF1C", "rx": "RX1", "rx_path": "prx",
+    # 默认 RF1+RF2（与下面的 rx_path_ports 等价）；换口只改这一行
+    "rf_port_combo": "RF1+RF2",
     # 结构化 RF 口：参数配置里改端口名，程序自动生成路由/FDC/下拉显示
     "rx_path_ports": {m: {"scenario": p["scenario"],
                           "rx": list(p["rx"]),
@@ -5706,6 +5708,8 @@ def run_selftest():
     assert rx_path_display("drx", None) == RX_PATH_UI["drx"], "默认显示串不变"
     assert rx_path_display("prx_drx", None) == RX_PATH_UI["prx_drx"], "默认 MIMO 显示串"
     _pcfg = dict(cfg, rx_path="drx")
+    # 本用例测的是手写端口表：默认已有 RF1+RF2 预设，必须先清空预设才不会被覆盖
+    _pcfg["rf_port_combo"] = ""
     _pcfg["rx_path_ports"] = {m: {"scenario": p["scenario"], "rx": list(p["rx"]),
                                   "tx": [list(t) for t in p["tx"]]}
                               for m, p in cfg["rx_path_ports"].items()}
