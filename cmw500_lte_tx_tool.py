@@ -995,7 +995,7 @@ METRIC_LABELS = {
     "aclr": "ACLR",
     "evm": "EVM",
     "freqerr": "频率误差",
-    "sensitivity": "灵敏度(探底)",
+    "sensitivity": "3信道灵敏度探底",
 }
 
 # 灵敏度功率档（RX 模块）：UE 上行发射功率工况，影响发射机自干扰下的接收灵敏度(desense)
@@ -1518,13 +1518,58 @@ def all_band_channels(band, bw=None):
     return [("全", earfcn) for earfcn in range(lo, hi + 1)]
 
 
-def band_points_count(band, bw, full_scan=False):
-    """某 (频段,带宽) 的测试点数：全信道扫描=全部合法 EARFCN 数，否则=3 点。
+def range_channels(band, bw, start, end):
+    """自定义信道范围：返回 [start, end] 内该频段带宽下的合法 DL EARFCN。
 
-    界面上的「N 测试点」必须和 build_combos 实际枚举出来的组合数一致，
-    否则勾了全信道还显示 3 点，用户没法据此预估耗时。
+    只保留 all_band_channels() 中的合法信道，越界部分忽略；位置标签统一为
+    「范围」。start > end 时自动交换，非法输入返回空列表。
     """
     try:
+        lo, hi = int(start), int(end)
+    except (TypeError, ValueError):
+        return []
+    if lo > hi:
+        lo, hi = hi, lo
+    return [("范围", earfcn) for _pos, earfcn in all_band_channels(band, bw)
+            if lo <= earfcn <= hi]
+
+
+def normalize_channel_ranges(raw):
+    """规范化自定义信道范围：{band: {bw: [首,末]}}，只保留合法整数对。
+
+    读盘/热重载可能有字符串数字或首末颠倒，这里统一成 int 且升序；
+    坏条目直接丢弃，不让配置污染组合枚举。
+    """
+    out = {}
+    for b, ws in (raw or {}).items():
+        if not isinstance(ws, dict):
+            continue
+        inner = {}
+        for w, v in ws.items():
+            try:
+                if len(v) != 2:
+                    continue
+                lo, hi = int(v[0]), int(v[1])
+                if lo > hi:
+                    lo, hi = hi, lo
+                inner[str(w)] = [lo, hi]
+            except (TypeError, ValueError):
+                continue
+        if inner:
+            out[str(b)] = inner
+    return out
+
+
+def band_points_count(band, bw, full_scan=False, channel_ranges=None):
+    """某 (频段,带宽) 的测试点数：自定义范围 > 全信道 > 默认 3 点。
+
+    界面上的「N 测试点」必须和 build_combos 实际枚举出来的组合数一致，
+    否则用户没法据此预估耗时。
+    """
+    try:
+        rng = ((channel_ranges or {}).get(band) or {}).get(bw)
+        if rng:
+            return len(range_channels(band, bw, rng[0], rng[1]))
         if full_scan:
             return len(all_band_channels(band, bw))
         return len(band_channels(band, bw))
@@ -1532,17 +1577,23 @@ def band_points_count(band, bw, full_scan=False):
         return 0
 
 
-def build_combos(bands, band_bws, full_scan=False):
+def build_combos(bands, band_bws, full_scan=False, channel_ranges=None):
     """测试项 = 每个已选频段 × 该频段自己勾选的带宽 × 信道集。
 
-    默认信道集为低/中/高三点；full_scan=True 时按 TS 36.101 口径枚举该
-    (频段,带宽) 下全部合法 DL EARFCN，用于全信道灵敏度探底。
+    信道集优先级：自定义范围（channel_ranges[band][bw] = [首,末]）> 全信道
+    > 默认低/中/高三点。自定义范围与全信道由界面保证互斥，这里以范围优先。
     返回 (combos, skipped)，combos 元素为 (band, bw, 位置, DL EARFCN)。
     """
     combos, skipped = [], []
     for b in (bands or []):
         for w in (band_bws.get(b) or []):
-            chans = all_band_channels(b, w) if full_scan else band_channels(b, w)
+            rng = ((channel_ranges or {}).get(b) or {}).get(w)
+            if rng:
+                chans = range_channels(b, w, rng[0], rng[1])
+            elif full_scan:
+                chans = all_band_channels(b, w)
+            else:
+                chans = band_channels(b, w)
             if not chans:
                 skipped.append(combo_display(b, w))
                 continue
@@ -2242,8 +2293,11 @@ CONFIG_DEFAULTS = {
     # Pmin 档续扫时是否跳过 EBLer warmup（1=跳过，省约 0.7s/信道；0=每次都预同步）。
     # 只有「该功率档已在本频段测过信道」时才可能跳过，切档后首次测量始终 warmup。
     "sens_skip_warmup_low": "1",
-    # 全信道扫描：勾选后每个 (频段,带宽) 枚举全部合法 DL EARFCN，逐信道探底灵敏度
+    # 全信道扫描：勾选后每个 (频段,带宽) 枚举全部合法 DL EARFCN，所有指标逐点测
     "full_scan": False,
+    # 自定义信道范围：与 full_scan 互斥；channel_ranges = {band: {bw: [首,末]}}
+    "range_scan": False,
+    "channel_ranges": {},
     "metrics": {k: True for k in METRIC_KEYS},
 }
 
@@ -6723,6 +6777,21 @@ def run_selftest():
         (_all[:3], _all[-3:], len(_all))
     _cmb_full, _skp_full = build_combos(["OB1"], {"OB1": ["B100"]}, full_scan=True)
     assert len(_cmb_full) == 501 and _cmb_full[0][3] == 50 and _cmb_full[-1][3] == 550
+    # 自定义信道范围：按首末取合法 EARFCN，优先级高于全信道
+    assert METRIC_LABELS["sensitivity"] == "3信道灵敏度探底"
+    assert len(range_channels("OB1", "B100", 100, 200)) == 101
+    assert range_channels("OB1", "B100", 100, 200)[0] == ("范围", 100)
+    assert range_channels("OB1", "B100", 200, 100)[-1][1] == 200  # 首末颠倒自动交换
+    assert all(50 <= ch <= 550 for _p, ch in range_channels("OB1", "B100", 0, 999))
+    _nr = normalize_channel_ranges(
+        {"OB1": {"B100": ["100", "200"]}, "OB2": {"B014": [300, 100]}})
+    assert _nr == {"OB1": {"B100": [100, 200]}, "OB2": {"B014": [100, 300]}}, _nr
+    assert normalize_channel_ranges({"OB1": {"B100": [1, 2, 3]}}) == {}
+    _rr = {"OB1": {"B100": [100, 120]}}
+    _cmb_range, _ = build_combos(["OB1"], {"OB1": ["B100"]},
+                                 full_scan=True, channel_ranges=_rr)
+    assert len(_cmb_range) == 21 and _cmb_range[0][2] == "范围", _cmb_range[:3]
+    assert band_points_count("OB1", "B100", True, _rr) == 21
     # 界面「N 测试点」必须与 build_combos 同口径：全信道开启后不能仍按 3 点算
     assert band_points_count("OB1", "B100") == 3
     assert band_points_count("OB1", "B100", True) == 501
@@ -7125,7 +7194,7 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
      「Pmax+Pmin」时 TX 拆双列，末尾为大功率灵敏度 / 小功率灵敏度 /
      Desense(=大功率-小功率) 三列。
      电源功率(W) 与 EVM Peak 不再显示（原始值仍在内部明细里备查）。
-   - 灵敏度(探底)：CONF:LTE:SIGN:DL:RSEPre:LEVel 扫描 + INIT/FETC:EBLer
+   - 3信道灵敏度探底：CONF:LTE:SIGN:DL:RSEPre:LEVel 扫描 + INIT/FETC:EBLer
      （手册 23.4.2 / 23.5.10）。判定量 = FETC:LTE:SIGN:EBLer:REL? 第 5 值
      Throughput(%)（idx 4），Throughput ≥ 95%（config 的 sens_throughput 可改）
      判 PASS，与 ASRrun 参考工具/3GPP 36.521-1 判据一致。
@@ -7168,10 +7237,16 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
      specs\LTE\bands.json（RF Band Tool / 3GPP R19 的本地快照，随工具一同复制）。
      工具运行与刷新只读本目录，不访问任何外部路径；该文件缺失时回退
      lte_channels.json 全量快照，再回退内置兜底表。
-   - 全信道扫描（RX 指标框复选框）：默认关，每个 (频段,带宽) 只测低/中/高三点；
-     勾选后按 TS 36.101 口径枚举该带宽下全部合法 DL EARFCN（同信道表窗口，
-     离频段边缘 ≥ B/2），逐信道灵敏度探底。例如 B1/10MHz = CH50~550 共 501 点，
-     耗时约为三信道的 167 倍，仅用于全面摸底。结果表首行与左三列在横/纵滚动时固定。
+   - 测试信道范围（RX 指标框，与指标勾选解耦）：默认每个 (频段,带宽) 只测
+     低/中/高三点。三种模式：
+     • 【全信道扫描】按 TS 36.101 口径枚举该带宽下全部合法 DL EARFCN
+       （离频段边缘 ≥ B/2）。例如 B1/10MHz = CH50~550 共 501 点，
+       耗时约为三信道的 167 倍，仅用于全面摸底；
+     • 【自定义范围】与全信道互斥。勾选后点【设置范围】，为每个已勾选的
+       频段×带宽填首末 DL EARFCN，范围内的合法信道全部测；未设置的组合
+       回退到默认三信道；
+     • 两者都不勾：默认低/中/高三点。
+     信道集对所有已勾选指标生效，不再依赖灵敏度是否勾选。
      运行 python refresh_lte_channels.py 可刷新快照与对照表。
      鼠标悬停频段复选框可查看该频段支持的带宽与三个信道。
    - 每个频段可独立选择不同带宽（例如 B1 只测 10MHz，B2 测 1.4/5/20MHz），
@@ -7351,25 +7426,37 @@ def _fit_combo_width(combo, values, min_width=10, pad_chars=3):
 
 
 def _attach_full_scan_tip(widget):
-    """全信道扫描复选框悬停提示：说明范围与耗时。"""
+    """全信道扫描复选框悬停提示：说明范围与耗时（独立于灵敏度勾选）。"""
     _attach_tip(widget,
-                "全信道扫描（RX 灵敏度探底）\n"
+                "全信道扫描（测试信道范围）\n"
                 "勾选后：每个已勾选频段×带宽，按 3GPP TS 36.101 口径枚举\n"
                 "该带宽下全部合法 DL EARFCN（含低/中/高之间所有信道），\n"
-                "逐信道执行灵敏度探底。信道数远多于默认 3 点，耗时显著增加。\n"
-                "未勾选：保持默认低/中/高三信道。")
+                "所有勾选的指标都按这些信道逐点测。与灵敏度是否勾选无关。\n"
+                "信道数远多于默认 3 点，耗时显著增加。\n"
+                "未勾选：保持默认低/中/高三信道（或自定义范围）。")
+
+
+def _attach_range_scan_tip(widget):
+    """自定义信道范围复选框悬停提示。"""
+    _attach_tip(widget,
+                "自定义信道范围（测试信道）\n"
+                "与【全信道扫描】互斥。勾选后，点【设置范围】为每个已勾选的\n"
+                "频段×带宽分别填首/末 DL EARFCN，该范围内的合法信道全部测。\n"
+                "所有勾选的指标都按这些信道测，与灵敏度是否勾选无关。\n"
+                "未设置范围的频段×带宽回退到默认低/中/高三点。")
 
 
 def _attach_sensitivity_tip(widget):
     """灵敏度探底复选框悬停提示：说明判据、扫描精度与耗时。"""
     _attach_tip(widget,
-                "灵敏度探底（RX 指标）\n"
+                "3信道灵敏度探底（RX 指标）\n"
                 "勾选后：从强信号开始逐级降低下行 RS EPRE，以 Throughput ≥ 95%\n"
                 "（可在参数配置中调整）为判据，找仍满足门限的最低电平。\n"
                 "• 三级步进：粗扫 → 中步 → 精扫 0.1dB，兼顾速度与精度\n"
                 "• 同频段带宽相邻信道复用热点结果，减少重复扫描\n"
-                "• 每信道需多轮 BLER 测量，耗时较长；配合【全信道扫描】逐点累计\n"
-                "未勾选：只测 TX 指标，不执行灵敏度扫描。")
+                "• 每信道需多轮 BLER 测量，耗时较长\n"
+                "「3信道」指默认信道集；勾选【全信道扫描】或自定义范围后，\n"
+                "灵敏度按对应信道集逐点测。未勾选：只测 TX 指标。")
 
 
 LOG_BOX_LINES = 15    # 底部运行日志区可见行数（右侧带滚动条可回看历史）
@@ -7545,8 +7632,10 @@ class App(tk.Tk):
             _mode = "high"
         self.sens_power_mode_var = tk.StringVar(value=_mode)
         self.sens_low_power_var = V("sens_low_power")
-        # 全信道扫描（RX）：勾选后枚举所选频段/带宽下全部合法 DL EARFCN 逐点探底
+        # 测试信道范围：全信道扫描 / 自定义首末信道 二选一，与灵敏度指标解耦
         self.full_scan_var = tk.BooleanVar(value=bool(c.get("full_scan", False)))
+        self.range_scan_var = tk.BooleanVar(value=bool(c.get("range_scan", False)))
+        self.channel_ranges = normalize_channel_ranges(c.get("channel_ranges"))
 
         # AT 控制行：串口选择（空/auto=自动识别）+ 手动 debug 指令输入
         self.at_port_var = V("at_port")
@@ -7898,17 +7987,25 @@ class App(tk.Tk):
         bf_rx.pack(side="left", fill="y")
         rframe = ttk.Frame(bf_rx)
         rframe.pack(fill="x")
-        # 全信道扫描放最前（灵敏度探底之前）
+        # 测试信道范围（与灵敏度指标解耦）：全信道 / 自定义范围 / 默认三信道
         self.full_scan_cb = ttk.Checkbutton(
             rframe, text="全信道扫描", variable=self.full_scan_var,
             command=self._on_full_scan_toggle)
-        self.full_scan_cb.grid(row=0, column=0, sticky="w", padx=(2, 12), pady=3)
+        self.full_scan_cb.grid(row=0, column=0, sticky="w", padx=(2, 10), pady=3)
         _attach_full_scan_tip(self.full_scan_cb)
+        self.range_scan_cb = ttk.Checkbutton(
+            rframe, text="自定义范围", variable=self.range_scan_var,
+            command=self._on_range_scan_toggle)
+        self.range_scan_cb.grid(row=0, column=1, sticky="w", padx=(2, 10), pady=3)
+        _attach_range_scan_tip(self.range_scan_cb)
+        ttk.Button(rframe, text="设置范围", width=9,
+                   command=self._open_channel_range_dialog).grid(
+                       row=0, column=2, sticky="w", padx=(2, 10), pady=3)
         self.sensitivity_cb = ttk.Checkbutton(
             rframe, text=METRIC_LABELS["sensitivity"],
             variable=self.metric_vars["sensitivity"],
             command=self._on_metrics_change)
-        self.sensitivity_cb.grid(row=0, column=1, sticky="w", padx=(2, 16), pady=3)
+        self.sensitivity_cb.grid(row=0, column=3, sticky="w", padx=(2, 6), pady=3)
         _attach_sensitivity_tip(self.sensitivity_cb)
         # 外部衰减（旧版手动输入框已移除，改用 freq_loss_segments 按频段/信道
         # 自动插值补偿 EATT:OUTP/EATT:INP，见 retune_cell + else 快速路径）
@@ -8201,14 +8298,149 @@ class App(tk.Tk):
         self._set_status("已清空全部选择：取消 %d 个频段及全部带宽勾选" % n_bands)
 
     def _on_full_scan_toggle(self):
-        """全信道扫描开关：测试点数口径跟着变，立刻重算顶部汇总。
-
-        不重算的话，勾上后仍显示「36 测试点」（3 信道口径），而实际会跑
-        几百上千个组合，用户会按错的耗时预估去安排时间。
-        """
+        """全信道扫描开关：与自定义范围互斥，立刻重算顶部测试点数。"""
+        if self.full_scan_var.get() and self.range_scan_var.get():
+            self.range_scan_var.set(False)
         self._refresh_band_bw_summary()
         if self.full_scan_var.get():
             self._set_status("全信道扫描已开启：测试点数按全部合法信道计算，耗时显著增加")
+
+    def _on_range_scan_toggle(self):
+        """自定义信道范围开关：与全信道扫描互斥，提示是否已设置范围。"""
+        if self.range_scan_var.get() and self.full_scan_var.get():
+            self.full_scan_var.set(False)
+        self._refresh_band_bw_summary()
+        if self.range_scan_var.get():
+            n = sum(1 for b in ALL_BANDS if self.band_vars[b].get()
+                    for w in BW_CHOICES
+                    if w in band_supported_bws(b)
+                    and self.band_bw_vars[b][w].get()
+                    and w in (self.channel_ranges.get(b) or {}))
+            self._set_status("自定义信道范围已开启：%d 个频段×带宽已设范围%s" %
+                             (n, "" if n else "，请点【设置范围】填写首末信道"))
+
+    def _open_channel_range_dialog(self):
+        """弹窗为每个已勾选 (频段,带宽) 设置首末 DL EARFCN。
+
+        只列已勾选且该带宽合法的频段×带宽；首末须落在该带宽的合法 EARFCN
+        范围内（与全信道枚举同口径）。取消时恢复进入前的范围表。
+        """
+        pairs = [(b, w) for b in ALL_BANDS if self.band_vars[b].get()
+                 for w in BW_CHOICES if w in band_supported_bws(b)
+                 and self.band_bw_vars[b][w].get()]
+        if not pairs:
+            messagebox.showinfo("自定义信道范围", "请先勾选频段及其带宽。")
+            return
+        orig = json.loads(json.dumps(self.channel_ranges))
+        win = tk.Toplevel(self)
+        win.title("自定义信道范围")
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text="选择频段×带宽，填首/末 DL EARFCN 后点【添加】；"
+                            "未设置的组合保持默认三信道。").pack(
+                                anchor="w", padx=10, pady=(10, 6))
+        band_names = []
+        band_by_name = {}
+        for b, _w in pairs:
+            nm = band_label(b)
+            if nm not in band_by_name:
+                band_names.append(nm)
+                band_by_name[nm] = b
+        row1 = ttk.Frame(win)
+        row1.pack(fill="x", padx=10, pady=2)
+        ttk.Label(row1, text="频段").pack(side="left")
+        band_cb = ttk.Combobox(row1, values=band_names, state="readonly", width=10)
+        band_cb.set(band_names[0])
+        band_cb.pack(side="left", padx=(4, 12))
+        ttk.Label(row1, text="带宽").pack(side="left")
+        bw_cb = ttk.Combobox(row1, state="readonly", width=10)
+        bw_cb.pack(side="left", padx=4)
+        row2 = ttk.Frame(win)
+        row2.pack(fill="x", padx=10, pady=2)
+        ttk.Label(row2, text="首信道").pack(side="left")
+        start_e = ttk.Entry(row2, width=9)
+        start_e.pack(side="left", padx=(4, 10))
+        ttk.Label(row2, text="末信道").pack(side="left")
+        end_e = ttk.Entry(row2, width=9)
+        end_e.pack(side="left", padx=4)
+
+        def bw_names_for(band):
+            return {bw_label(w): w for bb, w in pairs if bb == band}
+
+        def refresh_bw(_evt=None):
+            b = band_by_name.get(band_cb.get())
+            names = list(bw_names_for(b).keys()) if b else []
+            bw_cb.configure(values=names)
+            if names:
+                bw_cb.set(names[0])
+
+        band_cb.bind("<<ComboboxSelected>>", refresh_bw)
+        refresh_bw()
+
+        entries = []
+
+        def refresh_list():
+            entries[:] = [(b, w, v[0], v[1])
+                          for b in ALL_BANDS
+                          for w, v in sorted((self.channel_ranges.get(b) or {}).items())
+                          if (b, w) in pairs]
+            lb.delete(0, tk.END)
+            for b, w, lo, hi in entries:
+                lb.insert(tk.END, "%s / %s : CH%d~CH%d（%d 点）" %
+                          (band_label(b), bw_label(w), lo, hi,
+                           len(range_channels(b, w, lo, hi))))
+
+        def add_range():
+            b = band_by_name.get(band_cb.get())
+            w = bw_names_for(b).get(bw_cb.get()) if b else None
+            if not b or not w:
+                messagebox.showwarning("自定义信道范围", "请选择频段和带宽。", parent=win)
+                return
+            try:
+                lo, hi = int(start_e.get().strip()), int(end_e.get().strip())
+            except ValueError:
+                messagebox.showwarning("自定义信道范围", "首末信道必须是整数。", parent=win)
+                return
+            if lo > hi:
+                lo, hi = hi, lo
+            legal = all_band_channels(b, w)
+            if not legal:
+                messagebox.showwarning("自定义信道范围",
+                                       "%s/%s 无合法 DL EARFCN。" %
+                                       (band_label(b), bw_label(w)), parent=win)
+                return
+            cmin, cmax = legal[0][1], legal[-1][1]
+            if lo < cmin or hi > cmax:
+                messagebox.showwarning(
+                    "自定义信道范围",
+                    "%s/%s 合法 DL EARFCN 为 %d~%d。" %
+                    (band_label(b), bw_label(w), cmin, cmax), parent=win)
+                return
+            self.channel_ranges.setdefault(b, {})[w] = [lo, hi]
+            refresh_list()
+
+        def del_range():
+            sel = lb.curselection()
+            if not sel:
+                return
+            b, w = entries[sel[0]][:2]
+            (self.channel_ranges.get(b) or {}).pop(w, None)
+            refresh_list()
+
+        ttk.Button(row2, text="添加", width=8, command=add_range).pack(side="left", padx=(12, 0))
+        ttk.Label(win, text="已设置范围（选中后可删除）:").pack(
+            anchor="w", padx=10, pady=(8, 2))
+        lb = tk.Listbox(win, width=54, height=6)
+        lb.pack(padx=10, fill="both")
+        refresh_list()
+        row3 = ttk.Frame(win)
+        row3.pack(fill="x", padx=10, pady=6)
+        ttk.Button(row3, text="删除选中", command=del_range).pack(side="left")
+        ttk.Button(row3, text="取消", command=lambda: (self.channel_ranges.clear(),
+                   self.channel_ranges.update(orig), win.destroy())).pack(side="right")
+        ttk.Button(row3, text="确定", command=lambda: (
+            self._refresh_band_bw_summary(), win.destroy())).pack(side="right", padx=(0, 6))
+        win.grab_set()
 
     def _refresh_band_bw_summary(self):
         bands = [b for b in ALL_BANDS if self.band_vars[b].get()]
@@ -8222,12 +8454,15 @@ class App(tk.Tk):
         # 勾选「全信道扫描」时按全部合法 EARFCN 计数（与 build_combos 同口径），
         # 不能一律按低/中/高 3 点算，否则界面显示的点数远小于实际要测的组合数
         full = bool(self.full_scan_var.get()) if hasattr(self, "full_scan_var") else False
-        points = sum(band_points_count(b, w, full) for b, w in pairs)
+        ranges = (getattr(self, "channel_ranges", None)
+                  if getattr(self, "range_scan_var", None)
+                  and self.range_scan_var.get() else None)
+        points = sum(band_points_count(b, w, full, ranges) for b, w in pairs)
         detail = band_bws_summary(bands, bb, sep="；", limit=4)
         self.band_bw_summary_var.set(
             "已选 %d 频段 / %d 组合 / %d 测试点%s   ｜   %s" %
             (len(bands), len(pairs), points,
-             "（全信道）" if full else "", detail))
+             "（自定义范围）" if ranges else ("（全信道）" if full else ""), detail))
         # 表头总控状态同步：全勾=True / 部分或全空=False；无可作用频段则置灰
         for w in BW_CHOICES:
             tgt = self._head_bw_targets(w)
@@ -8975,6 +9210,8 @@ class App(tk.Tk):
             "sens_power_mode": self.sens_power_mode_var.get().strip(),  # 兼容旧调用
             "sens_low_power": self.sens_low_power_var.get().strip(),
             "full_scan": bool(self.full_scan_var.get()),
+            "range_scan": bool(self.range_scan_var.get()),
+            "channel_ranges": normalize_channel_ranges(self.channel_ranges),
             "at_port": self.at_port_var.get().strip(),
             "at_cmd": self.at_cmd_var.get().strip(),
             # GUI 启动时 AT 自动识别结果（供测量线程的掉线自动恢复使用）
@@ -8993,10 +9230,14 @@ class App(tk.Tk):
         cfg["bws"] = [w for w in BW_CHOICES
                       if any(w in band_bws.get(b, []) for b in cfg["bands"])]
         # 测试项 = 每个已选频段 × 该频段自己的带宽 × 信道
-        # 默认低/中/高三信道；勾选「全信道扫描」时枚举全部合法 DL EARFCN。
+        # 优先级：自定义范围 > 全信道 > 默认低/中/高三信道。
         # 信道按 (频段, 带宽) 从本目录 specs\LTE\bands.json 的 R19 数据取
+        if cfg["range_scan"]:
+            cfg["full_scan"] = False   # 配置文件里同时为真时以自定义范围为准
+        ranges = cfg["channel_ranges"] if cfg["range_scan"] else None
         combos, skipped = build_combos(cfg["bands"], band_bws,
-                                       full_scan=bool(cfg.get("full_scan")))
+                                       full_scan=bool(cfg.get("full_scan")),
+                                       channel_ranges=ranges)
         # TDD 授权过滤：仪表无 KS550 时 TDD band/CHAN 写入会被 -221/-222 拒绝，
         # 但 UE 仍在网 → 会产出"看着正常实则跑旧 FDD 小区"的无效数据（112703.log
         # 55 组）。探测一次（缓存），无授权则剔除全部 TDD 组合并明确告知。
@@ -9365,8 +9606,10 @@ class App(tk.Tk):
                              ("频段/各自带宽", band_bws_summary(
                                  cfg["bands"], cfg.get("band_bws") or {})),
                              ("带宽并集", ",".join(bw_label(w) for w in cfg["bws"])),
-                             ("扫描模式", "全信道（逐 EARFCN 探底）" if cfg.get("full_scan")
-                              else "低/中/高三信道"),
+                             ("扫描模式",
+                              "自定义范围" if cfg.get("range_scan")
+                              else ("全信道（逐 EARFCN）" if cfg.get("full_scan")
+                                    else "低/中/高三信道")),
                              ("电源启用", cfg["psu_enable"]),
                              ("指标", ",".join(k for k, v in cfg["metrics"].items() if v)),
                              ("信道表", channel_table_source()),
