@@ -2008,13 +2008,21 @@ def build_eatt_output_commands(cfg, loss):
 #   E36312A（E36300 系列）：SOUR:VOLT x,(@n) / OUTP ON,(@n)，N25V 正常模式输出 +25V。
 #   E3631A（老三路）：APPL <ch>,<v>,MAX / OUTP ON（无 (@n)），N25V 是真正的 -25V。
 # 通道名 P6V/P25V/N25V 两代相同，MEAS:CURR?/MEAS:VOLT? 用法也相同。
-PSU_MODELS = ("E36312A", "E3631A")
-PSU_CHANNELS = ("P6V", "P25V", "N25V")
+# E36300 / E3631A / 66300 三代的通道与命令完全不同，按型号分别定义。
+PSU_MODELS = ("E36312A", "E3631A", "66300系列")
+PSU_CHANNELS = ("P6V", "P25V", "N25V")       # E363x 通道（兼容旧引用）
+PSU_CHANNELS_66300 = ("OUT1", "OUT2")        # 66300 系列：主输出 / 辅助输出
 PSU_VOLT_RANGES = {
     "E36312A": {
         "P6V": (0.0, 6.18, "0 ~ 6.18 V"),
         "P25V": (0.0, 25.75, "0 ~ +25.75 V"),
         "N25V": (0.0, 25.75, "0 ~ +25.75 V"),
+    },
+    # 66300 系列（66319/66321/66309/66311/66111，见手册 6631-900xx）：
+    # 主输出 OUT1 = 0~15V/3A，辅助 OUT2 = 0~12V/1.5A（仅双路 66319/66309 有）
+    "66300系列": {
+        "OUT1": (0.0, 15.0, "0 ~ 15 V / 3A（主输出）"),
+        "OUT2": (0.0, 12.0, "0 ~ 12 V / 1.5A（辅助输出，仅 66319/66309）"),
     },
     # E3631A 手册 E3631-90002 p.84/97：CH1 0~6V/5A，CH2 0~+25V/1A，CH3 0~-25V/1A
     "E3631A": {
@@ -2024,6 +2032,11 @@ PSU_VOLT_RANGES = {
     },
 }
 PSU_VOLT_RANGE = PSU_VOLT_RANGES["E36312A"]   # 兼容旧引用
+
+
+def psu_channels(model):
+    """按电源型号返回可选通道列表；未知型号回落 E36312A 的三通道。"""
+    return PSU_CHANNELS_66300 if str(model or "").strip() == "66300系列" else PSU_CHANNELS
 
 
 def psu_volt_range(model, ch):
@@ -3243,12 +3256,24 @@ def build_psu_voltage_commands(cfg):
       OUTP 无参数，打开全部三路（故 P25V/N25V 请保持 0V 或不接负载）；
       N25V 是负电压通道，配置填幅值，下发时取负。电流限用 MAX，避免 DUT
       发射峰值触发限流导致电压跌落、影响功耗读数。
+    - 66300系列：VOLT <v> / CURR <n> / OUTP ON（主输出 OUT1）；辅助输出 OUT2
+      用 VOLT2 / CURR2 <n> / OUTP2 ON（手册 66319/66309 User's Guide ch.6/8）。
+      手册里 CURR 的设置参数只接受数字 <n>（MAX 只用于查询 CURR? MAX），故按
+      手册标称最大限流下发（OUT1=3.0712A、OUT2=1.52A），避免 DUT 发射峰值
+      触发限流导致电压跌落。该系列只有 GPIB（部分机型另有 RS-232），出厂地址 5。
     """
     if not cfg.get("psu_enable") or not cfg.get("psu_voltage"):
         return []
     ch = cfg.get("psu_channel", "P6V")
     v = float(cfg["psu_voltage"])
-    if str(cfg.get("psu_model") or "E36312A").strip() == "E3631A":
+    model = str(cfg.get("psu_model") or "E36312A").strip()
+    if model == "66300系列":
+        if ch not in PSU_CHANNELS_66300:
+            ch = PSU_CHANNELS_66300[0]
+        if ch == "OUT2":
+            return ["VOLT2 %.4f" % v, "CURR2 1.52", "OUTP2 ON"]
+        return ["VOLT %.4f" % v, "CURR 3.0712", "OUTP ON"]
+    if model == "E3631A":
         if ch not in PSU_CHANNELS:
             ch = PSU_CHANNELS[0]
         vv = -abs(v) if ch == "N25V" else v
@@ -3257,33 +3282,46 @@ def build_psu_voltage_commands(cfg):
     return ["SOUR:VOLT %.4f,(@%d)" % (v, n), "OUTP ON,(@%d)" % n]
 
 
+def psu_measure_commands(cfg, ch):
+    """按型号返回 (电流查询, 电压查询)。
+    - E363x：MEAS:CURR? <ch> / MEAS:VOLT? <ch>（通道名作参数）。
+    - 66300：MEAS:CURR? / MEAS:VOLT?（主输出），辅助输出用 CURR2?/VOLT2?（无通道名参数）。
+    """
+    if str(cfg.get("psu_model") or "").strip() == "66300系列":
+        if ch == "OUT2":
+            return "MEAS:CURR2?", "MEAS:VOLT2?"
+        return "MEAS:CURR?", "MEAS:VOLT?"
+    return "MEAS:CURR? %s" % ch, "MEAS:VOLT? %s" % ch
+
+
 def read_psu_snapshot(psu, cfg, log=None):
     if psu is None or not psu.connected or not cfg.get("psu_enable"):
         return None
-    ch = cfg.get("psu_channel") or PSU_CHANNELS[0]
+    ch = cfg.get("psu_channel") or psu_channels(cfg.get("psu_model"))[0]
+    cur_cmd, volt_cmd = psu_measure_commands(cfg, ch)
     n = max(1, int(cfg.get("psu_samples", PSU_DEFAULT_SAMPLES)))
     currents, volts = [], []
     for i in range(n):
         try:
-            resp = psu.query("MEAS:CURR? %s" % ch)
+            resp = psu.query(cur_cmd)
         except Exception as e:
             if log:
-                log("[PSU] ⚠️ MEAS:CURR? 超时：%s" % type(e).__name__)
+                log("[PSU] ⚠️ %s 超时：%s" % (cur_cmd, type(e).__name__))
             return None   # PSU 通信异常，本次快照放弃
         if log:
-            log("[PSU] MEAS:CURR? %s -> %s" % (ch, resp))
+            log("[PSU] %s -> %s" % (cur_cmd, resp))
         v = parse_scalar(resp)
         if v is not None:
             currents.append(v)
         if cfg.get("psu_read_voltage", True):
             try:
-                r2 = psu.query("MEAS:VOLT? %s" % ch)
+                r2 = psu.query(volt_cmd)
             except Exception as e:
                 if log:
-                    log("[PSU] ⚠️ MEAS:VOLT? 超时：%s" % type(e).__name__)
+                    log("[PSU] ⚠️ %s 超时：%s" % (volt_cmd, type(e).__name__))
                 continue
             if log:
-                log("[PSU] MEAS:VOLT? %s -> %s" % (ch, r2))
+                log("[PSU] %s -> %s" % (volt_cmd, r2))
             v2 = parse_scalar(r2)
             if v2 is not None:
                 volts.append(v2)
@@ -6537,7 +6575,22 @@ def run_selftest():
     assert psu_volt_range("E3631A", "P6V")[1] == 6.0
     assert psu_volt_range("E36312A", "P6V")[1] == 6.18
     assert psu_volt_range("未知型号", "P6V")[1] == 6.18, "未知型号回落 E36312A"
-    assert PSU_MODELS == ("E36312A", "E3631A")
+    # 66300 系列：VOLT/CURR/OUTP，辅助输出加 2 后缀；读回 MEAS:CURR?(2) 无通道名
+    pv66 = build_psu_voltage_commands(
+        dict(cfg, psu_model="66300系列", psu_enable=True, psu_voltage="3.8", psu_channel="OUT1"))
+    assert pv66 == ["VOLT 3.8000", "CURR 3.0712", "OUTP ON"], pv66
+    pv662 = build_psu_voltage_commands(
+        dict(cfg, psu_model="66300系列", psu_enable=True, psu_voltage="3.8", psu_channel="OUT2"))
+    assert pv662 == ["VOLT2 3.8000", "CURR2 1.52", "OUTP2 ON"], pv662
+    assert psu_channels("66300系列") == ("OUT1", "OUT2")
+    assert psu_channels("E36312A") == ("P6V", "P25V", "N25V")
+    assert psu_volt_range("66300系列", "OUT1")[1] == 15.0
+    assert psu_volt_range("66300系列", "OUT2")[1] == 12.0
+    assert psu_measure_commands({"psu_model": "66300系列"}, "OUT1") == ("MEAS:CURR?", "MEAS:VOLT?")
+    assert psu_measure_commands({"psu_model": "66300系列"}, "OUT2") == ("MEAS:CURR2?", "MEAS:VOLT2?")
+    assert psu_measure_commands({"psu_model": "E36312A"}, "P6V") == (
+        "MEAS:CURR? P6V", "MEAS:VOLT? P6V")
+    assert PSU_MODELS == ("E36312A", "E3631A", "66300系列")
     # 结果行
     d = demo_measurement(dict(cfg, metrics={k: True for k in METRIC_KEYS}))
     rows = make_rows(d, {"evm_lim": "17.5", "aclr_lim": "30", "freq_lim": "100"})
@@ -6923,6 +6976,11 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    - 电源 E3631A 没有 LAN，只有 GPIB / RS-232；本工具走 GPIB：电源型号选
      E3631A、接口选 GPIB、地址填主地址数字（出厂 5），需 GPIB 卡 + NI-488.2
      或 Keysight GPIB 驱动。程控语法自动切换为 APPL/OUTP（老机不认 (@n)）。
+   - 电源 66300 系列（66319/66321/66309/66311/66111）同样只有 GPIB（部分机型
+     另有 RS-232），出厂地址 5；型号选「66300系列」后接口自动切到 GPIB。
+     主输出 OUT1=0~15V/3A，辅助 OUT2=0~12V/1.5A（仅 66319/66309 有），
+     命令用 VOLT/CURR/OUTP（OUT2 用 VOLT2/CURR2/OUTP2），CURR 按手册最大限流
+     下发（3.0712A/1.52A），读回用 MEAS:CURR?（OUT2 用 MEAS:CURR2?）。
    - IP/端口/RF口/电压等全部自动保存到 config.json，下次启动自动恢复。
 
 1a. AT 控制（USB 串口 / 手动 debug）
@@ -7103,6 +7161,7 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    - PDF p.1737/1768      23.5.2 连接控制 / 23.5.10 BLER 命令
    - E36311-90008 p.5/17/69  SOUR:VOLT / 通道 / MEAS:CURR?
    - E3631-90002 p.84/96/97  APPLy / INST:SEL / OUTP / MEAS / CURR（老机命令）
+   - 66319/66309 User's Guide ch.6/8  VOLT/CURR/OUTP(1|2)、MEAS:CURR?(2)（66300 系列）
 """
 
 
@@ -7370,7 +7429,11 @@ class App(tk.Tk):
         }
         self.psu_port_var = V("psu_port")
         self.psu_board_var = tk.StringVar(value=gpib_board_label(_psu_board))
-        self.psu_channel_var = V("psu_channel")
+        _psu_model = str(self.psu_model_var.get()).strip()
+        _psu_chans = list(psu_channels(_psu_model))
+        _psu_ch = str(c.get("psu_channel", CONFIG_DEFAULTS.get("psu_channel", "")))
+        self.psu_channel_var = tk.StringVar(
+            value=_psu_ch if _psu_ch in _psu_chans else _psu_chans[0])
         self.psu_voltage_var = V("psu_voltage")
         # psu_readv 不再有勾选框：电压/电流默认记录，下发给 True
 
@@ -7554,6 +7617,7 @@ class App(tk.Tk):
         self.psu_model_cb = ttk.Combobox(f2, textvariable=self.psu_model_var,
                                          values=list(PSU_MODELS), width=10, state="readonly")
         self.psu_model_cb.grid(row=0, column=1, sticky="w")
+        self.psu_model_cb.bind("<<ComboboxSelected>>", self._on_psu_model_change)
         ttk.Label(f2, text="接口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
         self.psu_iface_cb = ttk.Combobox(f2, textvariable=self.psu_iface_var,
                                          values=list(LINK_MODES), width=5, state="readonly")
@@ -7591,25 +7655,31 @@ class App(tk.Tk):
         self._psu_hint = _attach_hint(self.psu_addr_entry, self.psu_host_var,
                                       lambda: self._addr_hint("psu"))
         ttk.Label(f2, text="通道:").grid(row=0, column=8, sticky="w", padx=(10, 4))
-        ch = ttk.Combobox(f2, textvariable=self.psu_channel_var, values=list(PSU_CHANNELS),
-                          width=8, state="readonly")
-        ch.grid(row=0, column=9, sticky="w")
-        _attach_tip(ch, lambda: (
+        self.psu_channel_cb = ttk.Combobox(f2, textvariable=self.psu_channel_var,
+                                           values=list(psu_channels(self.psu_model_var.get())),
+                                           width=8, state="readonly")
+        self.psu_channel_cb.grid(row=0, column=9, sticky="w")
+        _attach_tip(self.psu_channel_cb, lambda: (
             "电源输出通道（%s）：\n" % self.psu_model_var.get() +
-            ("• P6V = CH1，0 ~ 6 V\n• P25V = CH2，0 ~ +25 V\n"
-             "• N25V = CH3，0 ~ -25 V（负电压，填幅值即可）\n"
-             "• 老机无 LAN：只支持 GPIB / RS-232，本工具走 GPIB（出厂地址 5）\n"
-             if self.psu_model_var.get() == "E3631A" else
-             "• P6V = CH1，0 ~ 6.18 V\n• P25V = CH2，0 ~ +25.75 V\n"
-             "• N25V = CH3，0 ~ +25.75 V（正电压）\n"
-             "• N25V 是 SCPI 通道标识符，E36312A 正常模式下输出正电压")))
+            ("• OUT1 = 主输出，0 ~ 15 V / 3A\n• OUT2 = 辅助输出，0 ~ 12 V / 1.5A\n"
+             "   （OUT2 仅 66319/66309 双路机型有，单路机请选 OUT1）\n"
+             "• 66300 系列无 LAN：只支持 GPIB（部分机型另有 RS-232），本工具走 GPIB，"
+             "出厂地址 5\n• 命令：VOLT/CURR/OUTP（OUT2 用 VOLT2/CURR2/OUTP2）"
+             if self.psu_model_var.get() == "66300系列" else
+             ("• P6V = CH1，0 ~ 6 V\n• P25V = CH2，0 ~ +25 V\n"
+              "• N25V = CH3，0 ~ -25 V（负电压，填幅值即可）\n"
+              "• 老机无 LAN：只支持 GPIB / RS-232，本工具走 GPIB（出厂地址 5）\n"
+              if self.psu_model_var.get() == "E3631A" else
+              "• P6V = CH1，0 ~ 6.18 V\n• P25V = CH2，0 ~ +25.75 V\n"
+              "• N25V = CH3，0 ~ +25.75 V（正电压）\n"
+              "• N25V 是 SCPI 通道标识符，E36312A 正常模式下输出正电压"))))
         ttk.Label(f2, text="电压(V):").grid(row=0, column=10, sticky="w", padx=(8, 4))
         psu_volt_entry = ttk.Entry(f2, textvariable=self.psu_voltage_var, width=9)
         psu_volt_entry.grid(row=0, column=11, sticky="w")
         _attach_tip(psu_volt_entry, lambda: (
             "输出电压（V），范围随电源型号/通道变化：\n" +
             "".join("• %s: %s\n" % (c, psu_volt_range(self.psu_model_var.get(), c)[2])
-                    for c in PSU_CHANNELS) +
+                    for c in psu_channels(self.psu_model_var.get())) +
             "• 当前 %s / %s，超限会被拒绝" % (
                 self.psu_model_var.get(), self.psu_channel_var.get())))
         # 程控复选框：勾选才初始化/测量电源；放在电压输入框之后
@@ -8447,6 +8517,22 @@ class App(tk.Tk):
             return "GPIB", build_gpib_resource(board, primary), board
         return "LAN", a, board
 
+    def _on_psu_model_change(self, _event=None):
+        """电源型号切换：通道下拉换成该型号的通道集，当前值非法时取第一项。
+        66300 系列没有 LAN，自动把接口切到 GPIB 并回填默认地址 5。"""
+        chans = list(psu_channels(self.psu_model_var.get()))
+        cb = getattr(self, "psu_channel_cb", None)
+        if cb is not None:
+            cb["values"] = chans
+        if str(self.psu_channel_var.get()).strip() not in chans:
+            self.psu_channel_var.set(chans[0])
+        if str(self.psu_model_var.get()).strip() == "66300系列":
+            if str(self.psu_iface_var.get()).strip().upper() != "GPIB":
+                self.psu_iface_var.set("GPIB")
+            if not str(self.psu_host_var.get()).strip():
+                self.psu_host_var.set(CONFIG_DEFAULTS["psu_gpib_addr"])
+            self.log("[电源] 66300 系列仅支持 GPIB，已切换接口并回填地址 5")
+
     def _on_psu_enable_change(self):
         """程控复选框：未勾选时电源设置控件置灰，并刷新连接标签。"""
         on = bool(self.psu_enable_var.get())
@@ -8867,8 +8953,9 @@ class App(tk.Tk):
                                  % ("GPIB 主地址数字，如 5"
                                     if str(cfg.get("psu_link")).upper() == "GPIB"
                                     else "LAN 的 IP，如 192.168.1.200"))
-            if cfg["psu_channel"] not in PSU_CHANNELS:
-                raise ValueError("电源通道只能是 P6V/P25V/N25V")
+            _chans = list(psu_channels(cfg.get("psu_model")))
+            if cfg["psu_channel"] not in _chans:
+                raise ValueError("电源通道只能是 %s" % "/".join(_chans))
             if cfg["psu_voltage"]:
                 lo, hi, hint = psu_volt_range(cfg.get("psu_model"), cfg["psu_channel"])
                 v = float(cfg["psu_voltage"])
