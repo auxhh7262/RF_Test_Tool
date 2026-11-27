@@ -2200,6 +2200,31 @@ def normalize_cfg(data):
     return out
 
 
+def apply_ui_rf_to_cfg(cfg, combo, ports):
+    """把界面当前 RF 口组合写入 cfg（从 CONFIG_DEFAULTS 起步的 cfg 必须调用）。
+
+    _read_cfg() 用 dict(CONFIG_DEFAULTS) 起手，默认 rf_port_combo=RF1+RF2。
+    若只同步 rx_path_ports 而漏掉组合名，save_settings 会把界面所选组合
+    （如 RF1+RF3）覆盖回默认值；由于组合优先级高于端口表，实际下发的路由
+    又退回 RF1+RF2 —— 正是「界面显示 RF1+RF3、仪器仍走 RF1+RF2」的根因。
+
+    组合名与端口表两者同时落盘，且组合名优先时端口表也按同一组合展开，
+    避免 config.json 里出现「combo=RF1+RF2 但 ports 是 RF1+RF3」的分裂状态。
+    """
+    name = str(combo or "").strip()
+    normalized = normalize_rx_path_ports(ports)
+    preset = rf_ports_from_combo(name)
+    if preset:
+        # 预设组合：组合名与端口表强制同源，以组合为准展开
+        cfg["rf_port_combo"] = name
+        cfg["rx_path_ports"] = normalize_rx_path_ports(preset)
+    else:
+        # 自定义：组合名留空，完全按手写端口表下发
+        cfg["rf_port_combo"] = ""
+        cfg["rx_path_ports"] = normalized
+    return cfg
+
+
 def load_config():
     """读 config.json 并归一化；读不到/解析失败时用默认配置。"""
     data = {}
@@ -5794,6 +5819,20 @@ def run_selftest():
     # 归一化：非法组合名 → 退回 rx_path_ports（不报错、不改端口）
     assert normalize_cfg({"rf_port_combo": "RF9+RF10"})["rf_port_combo"] == ""
     assert normalize_cfg({"rf_port_combo": "RF1+RF2"})["rx_path_ports"] == _p1
+    # 界面保存回归：_read_cfg 从 CONFIG_DEFAULTS(默认 RF1+RF2) 起步，界面选
+    # RF1+RF3 后必须把组合名一起写回，否则 save_settings 写盘后组合退回默认，
+    # 实际下发 RF1+RF2 路由（界面显示与实际路由不一致）。
+    _ui_cfg = apply_ui_rf_to_cfg(dict(CONFIG_DEFAULTS), "RF1+RF3", _p13)
+    assert _ui_cfg["rf_port_combo"] == "RF1+RF3", "界面组合必须写回 cfg"
+    assert rx_route_from_ports("drx", rx_ports_cfg(normalize_cfg(_ui_cfg))) == \
+        "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF3C,TX2", "保存后下发应为 RF1+RF3 路由"
+    assert rx_route_from_ports("prx_drx", rx_ports_cfg(normalize_cfg(_ui_cfg))) == \
+        "ROUT:LTE:SIGN:SCEN:MIMO22 RF1C,RX1,RF1C,TX1,RF3C,TX2", "双流路由"
+    # 自定义（组合名空）：按手写端口表，不被默认组合覆盖
+    _ui_custom = apply_ui_rf_to_cfg(dict(CONFIG_DEFAULTS), "", _pcfg["rx_path_ports"])
+    assert _ui_custom["rf_port_combo"] == ""
+    assert rx_ports_cfg(normalize_cfg(_ui_custom)) == \
+        normalize_rx_path_ports(_pcfg["rx_path_ports"]), "自定义端口不被默认组合覆盖"
 
     # UDCH 双流 DL（灵敏度的 UDCH 分支）
     _ud = build_udch_commands("OB2", "B100", _mimo_cfg)
@@ -8531,9 +8570,11 @@ class App(tk.Tk):
     def _read_cfg(self):
         cfg = dict(CONFIG_DEFAULTS)
         _rx_mode = rx_path_from_ui(self.rx_path_var.get())
-        # 结构化 RF 口来自已加载/自动刷新的配置，保存设置时必须一并写回
-        cfg["rx_path_ports"] = normalize_rx_path_ports(
-            (self.cfg_loaded or {}).get("rx_path_ports"))
+        # RF 口组合/端口都用界面当前值覆盖 CONFIG_DEFAULTS 的默认组合；
+        # 否则 save_settings 会把用户选的 RF1+RF3 写回成默认 RF1+RF2，
+        # 而组合优先级高于端口表 → 界面显示 RF1+RF3、实际下发 RF1+RF2 路由。
+        apply_ui_rf_to_cfg(cfg, (self.cfg_loaded or {}).get("rf_port_combo"),
+                           (self.cfg_loaded or {}).get("rx_path_ports"))
         _rf, _rx = rx_path_ports(_rx_mode, cfg)
         # 地址记忆：LAN / GPIB 各存一份，接口来回切换都不丢（GPIB 只存主地址数字）
         _cmw_lan, _cmw_gp = self._addr_slots("cmw")
