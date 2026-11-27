@@ -995,7 +995,7 @@ METRIC_LABELS = {
     "aclr": "ACLR",
     "evm": "EVM",
     "freqerr": "频率误差",
-    "sensitivity": "3信道灵敏度探底",
+    "sensitivity": "三信道灵敏度",
 }
 
 # 灵敏度功率档（RX 模块）：UE 上行发射功率工况，影响发射机自干扰下的接收灵敏度(desense)
@@ -6778,7 +6778,7 @@ def run_selftest():
     _cmb_full, _skp_full = build_combos(["OB1"], {"OB1": ["B100"]}, full_scan=True)
     assert len(_cmb_full) == 501 and _cmb_full[0][3] == 50 and _cmb_full[-1][3] == 550
     # 自定义信道范围：按首末取合法 EARFCN，优先级高于全信道
-    assert METRIC_LABELS["sensitivity"] == "3信道灵敏度探底"
+    assert METRIC_LABELS["sensitivity"] == "三信道灵敏度"
     assert len(range_channels("OB1", "B100", 100, 200)) == 101
     assert range_channels("OB1", "B100", 100, 200)[0] == ("范围", 100)
     assert range_channels("OB1", "B100", 200, 100)[-1][1] == 200  # 首末颠倒自动交换
@@ -7194,7 +7194,7 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
      「Pmax+Pmin」时 TX 拆双列，末尾为大功率灵敏度 / 小功率灵敏度 /
      Desense(=大功率-小功率) 三列。
      电源功率(W) 与 EVM Peak 不再显示（原始值仍在内部明细里备查）。
-   - 3信道灵敏度探底：CONF:LTE:SIGN:DL:RSEPre:LEVel 扫描 + INIT/FETC:EBLer
+   - 三信道灵敏度：CONF:LTE:SIGN:DL:RSEPre:LEVel 扫描 + INIT/FETC:EBLer
      （手册 23.4.2 / 23.5.10）。判定量 = FETC:LTE:SIGN:EBLer:REL? 第 5 值
      Throughput(%)（idx 4），Throughput ≥ 95%（config 的 sens_throughput 可改）
      判 PASS，与 ASRrun 参考工具/3GPP 36.521-1 判据一致。
@@ -7239,10 +7239,10 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
      lte_channels.json 全量快照，再回退内置兜底表。
    - 测试信道范围（RX 指标框，与指标勾选解耦）：默认每个 (频段,带宽) 只测
      低/中/高三点。三种模式：
-     • 【全信道扫描】按 TS 36.101 口径枚举该带宽下全部合法 DL EARFCN
+     • 【全信道灵敏度】按 TS 36.101 口径枚举该带宽下全部合法 DL EARFCN
        （离频段边缘 ≥ B/2）。例如 B1/10MHz = CH50~550 共 501 点，
        耗时约为三信道的 167 倍，仅用于全面摸底；
-     • 【自定义范围】与全信道互斥。勾选后点【设置范围】，为每个已勾选的
+     • 【自定义信道范围】与全信道互斥。勾选后点【设置范围】，为每个已勾选的
        频段×带宽填首末 DL EARFCN，范围内的合法信道全部测；未设置的组合
        回退到默认三信道；
      • 两者都不勾：默认低/中/高三点。
@@ -7426,36 +7426,36 @@ def _fit_combo_width(combo, values, min_width=10, pad_chars=3):
 
 
 def _attach_full_scan_tip(widget):
-    """全信道扫描复选框悬停提示：说明范围与耗时（独立于灵敏度勾选）。"""
+    """全信道灵敏度复选框悬停提示：说明范围与耗时（独立于灵敏度勾选）。"""
     _attach_tip(widget,
-                "全信道扫描（测试信道范围）\n"
+                "全信道灵敏度（测试信道范围）\n"
                 "勾选后：每个已勾选频段×带宽，按 3GPP TS 36.101 口径枚举\n"
                 "该带宽下全部合法 DL EARFCN（含低/中/高之间所有信道），\n"
                 "所有勾选的指标都按这些信道逐点测。与灵敏度是否勾选无关。\n"
                 "信道数远多于默认 3 点，耗时显著增加。\n"
-                "未勾选：保持默认低/中/高三信道（或自定义范围）。")
+                "未勾选：保持默认低/中/高三信道（或自定义信道范围）。")
 
 
 def _attach_range_scan_tip(widget):
     """自定义信道范围复选框悬停提示。"""
     _attach_tip(widget,
                 "自定义信道范围（测试信道）\n"
-                "与【全信道扫描】互斥。勾选后，点【设置范围】为每个已勾选的\n"
+                "与【全信道灵敏度】互斥。勾选后，点【设置范围】为每个已勾选的\n"
                 "频段×带宽分别填首/末 DL EARFCN，该范围内的合法信道全部测。\n"
                 "所有勾选的指标都按这些信道测，与灵敏度是否勾选无关。\n"
                 "未设置范围的频段×带宽回退到默认低/中/高三点。")
 
 
 def _attach_sensitivity_tip(widget):
-    """灵敏度探底复选框悬停提示：说明判据、扫描精度与耗时。"""
+    """三信道灵敏度复选框悬停提示：说明判据、扫描精度与耗时。"""
     _attach_tip(widget,
-                "3信道灵敏度探底（RX 指标）\n"
+                "三信道灵敏度（RX 指标）\n"
                 "勾选后：从强信号开始逐级降低下行 RS EPRE，以 Throughput ≥ 95%\n"
                 "（可在参数配置中调整）为判据，找仍满足门限的最低电平。\n"
                 "• 三级步进：粗扫 → 中步 → 精扫 0.1dB，兼顾速度与精度\n"
                 "• 同频段带宽相邻信道复用热点结果，减少重复扫描\n"
                 "• 每信道需多轮 BLER 测量，耗时较长\n"
-                "「3信道」指默认信道集；勾选【全信道扫描】或自定义范围后，\n"
+                "「三信道」指默认信道集；勾选【全信道灵敏度】或【自定义信道范围】后，\n"
                 "灵敏度按对应信道集逐点测。未勾选：只测 TX 指标。")
 
 
@@ -7987,26 +7987,27 @@ class App(tk.Tk):
         bf_rx.pack(side="left", fill="y")
         rframe = ttk.Frame(bf_rx)
         rframe.pack(fill="x")
-        # 测试信道范围（与灵敏度指标解耦）：全信道 / 自定义范围 / 默认三信道
-        self.full_scan_cb = ttk.Checkbutton(
-            rframe, text="全信道扫描", variable=self.full_scan_var,
-            command=self._on_full_scan_toggle)
-        self.full_scan_cb.grid(row=0, column=0, sticky="w", padx=(2, 10), pady=3)
-        _attach_full_scan_tip(self.full_scan_cb)
-        self.range_scan_cb = ttk.Checkbutton(
-            rframe, text="自定义范围", variable=self.range_scan_var,
-            command=self._on_range_scan_toggle)
-        self.range_scan_cb.grid(row=0, column=1, sticky="w", padx=(2, 10), pady=3)
-        _attach_range_scan_tip(self.range_scan_cb)
-        ttk.Button(rframe, text="设置范围", width=9,
-                   command=self._open_channel_range_dialog).grid(
-                       row=0, column=2, sticky="w", padx=(2, 10), pady=3)
+        # 控件顺序：三信道灵敏度 → 全信道灵敏度 → 自定义信道范围 +【设置范围】
+        # 信道集与灵敏度指标解耦，全信道/自定义范围对所有已勾选指标生效
         self.sensitivity_cb = ttk.Checkbutton(
             rframe, text=METRIC_LABELS["sensitivity"],
             variable=self.metric_vars["sensitivity"],
             command=self._on_metrics_change)
-        self.sensitivity_cb.grid(row=0, column=3, sticky="w", padx=(2, 6), pady=3)
+        self.sensitivity_cb.grid(row=0, column=0, sticky="w", padx=(2, 10), pady=3)
         _attach_sensitivity_tip(self.sensitivity_cb)
+        self.full_scan_cb = ttk.Checkbutton(
+            rframe, text="全信道灵敏度", variable=self.full_scan_var,
+            command=self._on_full_scan_toggle)
+        self.full_scan_cb.grid(row=0, column=1, sticky="w", padx=(2, 10), pady=3)
+        _attach_full_scan_tip(self.full_scan_cb)
+        self.range_scan_cb = ttk.Checkbutton(
+            rframe, text="自定义信道范围", variable=self.range_scan_var,
+            command=self._on_range_scan_toggle)
+        self.range_scan_cb.grid(row=0, column=2, sticky="w", padx=(2, 10), pady=3)
+        _attach_range_scan_tip(self.range_scan_cb)
+        ttk.Button(rframe, text="设置范围", width=9,
+                   command=self._open_channel_range_dialog).grid(
+                       row=0, column=3, sticky="w", padx=(2, 6), pady=3)
         # 外部衰减（旧版手动输入框已移除，改用 freq_loss_segments 按频段/信道
         # 自动插值补偿 EATT:OUTP/EATT:INP，见 retune_cell + else 快速路径）
 
@@ -8303,7 +8304,7 @@ class App(tk.Tk):
             self.range_scan_var.set(False)
         self._refresh_band_bw_summary()
         if self.full_scan_var.get():
-            self._set_status("全信道扫描已开启：测试点数按全部合法信道计算，耗时显著增加")
+            self._set_status("全信道灵敏度已开启：测试点数按全部合法信道计算，耗时显著增加")
 
     def _on_range_scan_toggle(self):
         """自定义信道范围开关：与全信道扫描互斥，提示是否已设置范围。"""
@@ -8337,6 +8338,7 @@ class App(tk.Tk):
         win.transient(self)
         win.resizable(False, False)
         ttk.Label(win, text="选择频段×带宽，填首/末 DL EARFCN 后点【添加】；"
+                            "鼠标停在输入框上可查看该组合的合法范围；"
                             "未设置的组合保持默认三信道。").pack(
                                 anchor="w", padx=10, pady=(10, 6))
         band_names = []
@@ -8376,6 +8378,24 @@ class App(tk.Tk):
 
         band_cb.bind("<<ComboboxSelected>>", refresh_bw)
         refresh_bw()
+
+        def range_tip_text():
+            """首/末输入框悬停提示：随当前频段×带宽动态给出合法 EARFCN 范围。"""
+            b = band_by_name.get(band_cb.get())
+            w = bw_names_for(b).get(bw_cb.get()) if b else None
+            if not b or not w:
+                return "请先选择频段和带宽。"
+            legal = all_band_channels(b, w)
+            if not legal:
+                return "%s / %s：无合法 DL EARFCN。" % (band_label(b), bw_label(w))
+            cmin, cmax = legal[0][1], legal[-1][1]
+            return ("%s / %s 合法 DL EARFCN：%d ~ %d（共 %d 个）\n"
+                    "首/末信道须落在此范围内，范围内合法信道全部测试。" %
+                    (band_label(b), bw_label(w), cmin, cmax, len(legal)))
+
+        # _attach_tip 支持可调用文本：每次弹出时求值，切换频段/带宽后自动跟着变
+        _attach_tip(start_e, range_tip_text)
+        _attach_tip(end_e, range_tip_text)
 
         entries = []
 
@@ -8462,7 +8482,7 @@ class App(tk.Tk):
         self.band_bw_summary_var.set(
             "已选 %d 频段 / %d 组合 / %d 测试点%s   ｜   %s" %
             (len(bands), len(pairs), points,
-             "（自定义范围）" if ranges else ("（全信道）" if full else ""), detail))
+             "（自定义信道范围）" if ranges else ("（全信道灵敏度）" if full else ""), detail))
         # 表头总控状态同步：全勾=True / 部分或全空=False；无可作用频段则置灰
         for w in BW_CHOICES:
             tgt = self._head_bw_targets(w)
@@ -9607,8 +9627,8 @@ class App(tk.Tk):
                                  cfg["bands"], cfg.get("band_bws") or {})),
                              ("带宽并集", ",".join(bw_label(w) for w in cfg["bws"])),
                              ("扫描模式",
-                              "自定义范围" if cfg.get("range_scan")
-                              else ("全信道（逐 EARFCN）" if cfg.get("full_scan")
+                              "自定义信道范围" if cfg.get("range_scan")
+                              else ("全信道灵敏度（逐 EARFCN）" if cfg.get("full_scan")
                                     else "低/中/高三信道")),
                              ("电源启用", cfg["psu_enable"]),
                              ("指标", ",".join(k for k, v in cfg["metrics"].items() if v)),
