@@ -2022,7 +2022,7 @@ PSU_VOLT_RANGES = {
     # 主输出 OUT1 = 0~15V/3A，辅助 OUT2 = 0~12V/1.5A（仅双路 66319/66309 有）
     "66300系列": {
         "OUT1": (0.0, 15.0, "0 ~ 15 V / 3A（主输出）"),
-        "OUT2": (0.0, 12.0, "0 ~ 12 V / 1.5A（辅助输出，仅 66319/66309）"),
+        "OUT2": (0.0, 12.0, "0 ~ 12 V / 1.5A（辅助输出，仅 66319/66309 双路机）"),
     },
     # E3631A 手册 E3631-90002 p.84/97：CH1 0~6V/5A，CH2 0~+25V/1A，CH3 0~-25V/1A
     "E3631A": {
@@ -2043,6 +2043,28 @@ def psu_volt_range(model, ch):
     """按电源型号/通道返回 (下限, 上限, 提示文本)；未知型号回落 E36312A。"""
     table = PSU_VOLT_RANGES.get(str(model or "").strip()) or PSU_VOLT_RANGES["E36312A"]
     return table.get(ch, (0.0, 0.0, "未知通道"))
+
+
+# 接口能力：下拉选项只显示该设备/型号真正支持的接口。
+# 老电源（E3631A、66300 系列）没有 LAN，只允许 GPIB；E36312A LAN/GPIB 都可。
+# 任何新仪器/型号都在这里加一行，界面下拉与启动校验会自动跟着走。
+PSU_LINK_MODES = {
+    "E36312A":   ("LAN", "GPIB"),
+    "E3631A":    ("GPIB",),
+    "66300系列": ("GPIB",),
+}
+CMW_LINK_MODES = ("LAN", "GPIB")   # CMW500：LAN 标配，GPIB 为选件
+
+
+def link_modes_for(device, model=None):
+    """返回设备/型号支持的接口列表；界面下拉与配置校验都调用它。
+
+    device = "psu" 时按电源型号取能力表；未知型号保守地保留 LAN+GPIB。
+    device = "cmw" 及其余设备返回对应能力表，保证新仪器同样按规则限制。
+    """
+    if str(device).strip().lower() == "psu":
+        return PSU_LINK_MODES.get(str(model or "").strip(), LINK_MODES)
+    return CMW_LINK_MODES
 
 
 PSU_DEFAULT_SAMPLES = 3
@@ -6591,6 +6613,12 @@ def run_selftest():
     assert psu_measure_commands({"psu_model": "E36312A"}, "P6V") == (
         "MEAS:CURR? P6V", "MEAS:VOLT? P6V")
     assert PSU_MODELS == ("E36312A", "E3631A", "66300系列")
+    # 接口能力：只支持 GPIB 的型号，下拉里不能有 LAN（E3631A / 66300系列含 66311B）
+    assert link_modes_for("psu", "E36312A") == ("LAN", "GPIB")
+    assert link_modes_for("psu", "E3631A") == ("GPIB",)
+    assert link_modes_for("psu", "66300系列") == ("GPIB",)
+    assert link_modes_for("psu", "未知型号") == LINK_MODES
+    assert link_modes_for("cmw") == ("LAN", "GPIB"), "仪表下拉维持 LAN/GPIB"
     # 结果行
     d = demo_measurement(dict(cfg, metrics={k: True for k in METRIC_KEYS}))
     rows = make_rows(d, {"evm_lim": "17.5", "aclr_lim": "30", "freq_lim": "100"})
@@ -7413,8 +7441,11 @@ class App(tk.Tk):
         self.psu_model_var = V("psu_model")     # 默认 E36312A，后续可扩展其它电源
         self.psu_enable_var = B("psu_enable")   # 勾选才程控电源（读 config，默认 True）
         _psu_link = str(c.get("psu_link") or "").strip().upper()
-        _psu_mode = (_psu_link if _psu_link in LINK_MODES
+        _psu_modes = link_modes_for("psu", c.get("psu_model"))
+        _psu_mode = (_psu_link if _psu_link in _psu_modes
                      else link_mode_from_address(c.get("psu_ip", "")))
+        if _psu_mode not in _psu_modes:   # 型号不支持的接口一律退回其首选接口
+            _psu_mode = _psu_modes[0]
         self.psu_iface_var = tk.StringVar(value=_psu_mode)
         _psu_prim, _psu_board = split_gpib_cfg(c.get("psu_ip", ""),
                                                c.get("psu_gpib_board", 0))
@@ -7619,8 +7650,10 @@ class App(tk.Tk):
         self.psu_model_cb.grid(row=0, column=1, sticky="w")
         self.psu_model_cb.bind("<<ComboboxSelected>>", self._on_psu_model_change)
         ttk.Label(f2, text="接口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
-        self.psu_iface_cb = ttk.Combobox(f2, textvariable=self.psu_iface_var,
-                                         values=list(LINK_MODES), width=5, state="readonly")
+        self.psu_iface_cb = ttk.Combobox(
+            f2, textvariable=self.psu_iface_var,
+            values=list(link_modes_for("psu", self.psu_model_var.get())),
+            width=5, state="readonly")
         self.psu_iface_cb.grid(row=0, column=3, sticky="w")
         self.psu_iface_cb.bind("<<ComboboxSelected>>",
                                lambda _e: self._on_link_mode_change("psu"))
@@ -7662,7 +7695,7 @@ class App(tk.Tk):
         _attach_tip(self.psu_channel_cb, lambda: (
             "电源输出通道（%s）：\n" % self.psu_model_var.get() +
             ("• OUT1 = 主输出，0 ~ 15 V / 3A\n• OUT2 = 辅助输出，0 ~ 12 V / 1.5A\n"
-             "   （OUT2 仅 66319/66309 双路机型有，单路机请选 OUT1）\n"
+             "   （OUT2 仅 66319/66309 双路机有；66321/66311/66111 单路机只有 OUT1）\n"
              "• 66300 系列无 LAN：只支持 GPIB（部分机型另有 RS-232），本工具走 GPIB，"
              "出厂地址 5\n• 命令：VOLT/CURR/OUTP（OUT2 用 VOLT2/CURR2/OUTP2）"
              if self.psu_model_var.get() == "66300系列" else
@@ -7689,6 +7722,7 @@ class App(tk.Tk):
         self.psu_label = ttk.Label(f2, text="● 未连接", foreground="#888888")
         self.psu_label.grid(row=0, column=13, sticky="w", padx=(10, 2))
         self._on_psu_enable_change()  # 按勾选状态刷新电源控件可用状态
+        self._apply_link_mode("psu")  # 按初始接口刷新板号/地址框状态与提示
 
         # 参数配置 / 频段参数：右侧每行一个；上边距 18px 抵消 LabelFrame 标题占位，
         # 使按钮中心与同行输入框中心齐平（实测偏差 0 px）
@@ -8518,20 +8552,30 @@ class App(tk.Tk):
         return "LAN", a, board
 
     def _on_psu_model_change(self, _event=None):
-        """电源型号切换：通道下拉换成该型号的通道集，当前值非法时取第一项。
-        66300 系列没有 LAN，自动把接口切到 GPIB 并回填默认地址 5。"""
-        chans = list(psu_channels(self.psu_model_var.get()))
+        """电源型号切换：接口/通道下拉只保留该型号支持的选项，非法当前值取首项。
+
+        只支持 GPIB 的型号（E3631A / 66300 系列）下拉里没有 LAN，地址回填 5；
+        任何新型号只要在 PSU_LINK_MODES / psu_channels 登记，这里自动生效。
+        """
+        model = str(self.psu_model_var.get()).strip()
+        chans = list(psu_channels(model))
         cb = getattr(self, "psu_channel_cb", None)
         if cb is not None:
             cb["values"] = chans
-        if str(self.psu_channel_var.get()).strip() not in chans:
+        if str(self.psu_channel_var.get()).strip().upper() not in chans:
             self.psu_channel_var.set(chans[0])
-        if str(self.psu_model_var.get()).strip() == "66300系列":
-            if str(self.psu_iface_var.get()).strip().upper() != "GPIB":
-                self.psu_iface_var.set("GPIB")
-            if not str(self.psu_host_var.get()).strip():
-                self.psu_host_var.set(CONFIG_DEFAULTS["psu_gpib_addr"])
-            self.log("[电源] 66300 系列仅支持 GPIB，已切换接口并回填地址 5")
+        modes = list(link_modes_for("psu", model))
+        icb = getattr(self, "psu_iface_cb", None)
+        if icb is not None:
+            icb["values"] = modes
+        if str(self.psu_iface_var.get()).strip().upper() not in modes:
+            self.psu_iface_var.set(modes[0])
+        if modes == ["GPIB"] and not str(self.psu_host_var.get()).strip():
+            self.psu_host_var.set(CONFIG_DEFAULTS["psu_gpib_addr"])
+        self._apply_link_mode("psu")
+        if _event is not None and modes == ["GPIB"]:
+            self.log("[电源] %s 仅支持 GPIB：接口下拉已限定为 GPIB，地址 %s"
+                     % (model, self.psu_host_var.get()))
 
     def _on_psu_enable_change(self):
         """程控复选框：未勾选时电源设置控件置灰，并刷新连接标签。"""
@@ -8948,6 +8992,10 @@ class App(tk.Tk):
         if eatt < 0 or eatt > 80:
             raise ValueError("外部衰减值需在 0 ~ 80 dB 之间")
         if cfg["psu_enable"]:
+            _modes = link_modes_for("psu", cfg.get("psu_model"))
+            if str(cfg.get("psu_link")).upper() not in _modes:
+                raise ValueError("电源接口只能是 %s（当前型号 %s）"
+                                 % ("/".join(_modes), cfg.get("psu_model")))
             if not link_addr(cfg, "psu"):
                 raise ValueError("请填写电源地址（%s，电源默认启用）"
                                  % ("GPIB 主地址数字，如 5"

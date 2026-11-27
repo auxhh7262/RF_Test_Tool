@@ -7,7 +7,7 @@
   "_comment3": "at_port 填你的 AT 口 COM 号（无 AT 功能可忽略）",
   "instrument": "CMW500",
   "psu_model": "E36312A",
-  "_comment_psu_model": "电源型号 E36312A(默认,LAN 5025 或 GPIB) / E3631A(老三路) / 66300系列(66319/66321/66309/66311/66111)。后两者无 LAN, 只能 GPIB(出厂地址 5)。E3631A 用 APPL/OUTP, N25V 为 -25V(填幅值), OUTP ON 开全部三路。66300 系列通道 OUT1(0~15V/3A)/OUT2(0~12V/1.5A, 仅双路机), 用 VOLT/CURR/OUTP(OUT2 加 2 后缀)。",
+  "_comment_psu_model": "电源型号 E36312A(默认,LAN 5025 或 GPIB) / E3631A(老三路) / 66300系列(66319/66321/66309/66311/66111)。界面接口/通道下拉只显示当前型号支持的选项: E36312A=LAN+GPIB, 后两者无 LAN 只能 GPIB(出厂地址 5)。E3631A 用 APPL/OUTP, N25V 为 -25V(填幅值), OUTP ON 开全部三路。66300 系列: OUT1(0~15V/3A, 66311B 等单路机用这个), OUT2(0~12V/1.5A, 仅 66319/66309 双路机有), 用 VOLT/CURR/OUTP(OUT2 加 2 后缀)。",
   "_comment_psu_enable": "程控: true=初始化并测量电源(电压/电流), false=不程控电源(射频指标不受影响)",
   "cmw_ip": "192.168.1.100",
   "cmw_port": "5025",
