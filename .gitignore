@@ -21,6 +21,8 @@ build/
 dist/
 # 自检输出
 selftest_result.txt
+# 上传助手的本地代理设置（不上传）
+upload_settings.json
 
 # ====== 运行数据 ======
 logs/
