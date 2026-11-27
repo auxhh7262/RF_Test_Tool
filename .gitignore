@@ -24,6 +24,7 @@ selftest_result.txt
 # ====== 运行数据 ======
 logs/
 result/
+state/
 
 # ====== IDE / 插件 ======
 .vscode/
