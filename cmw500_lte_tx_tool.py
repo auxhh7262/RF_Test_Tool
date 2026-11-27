@@ -1594,6 +1594,10 @@ RX_CONNECTORS = ["RX1", "RX2"]
 #   PRX        1cc 1+1    RF1COM / RFTX1                  RF1COM / RFRX1
 #   DRX        1cc 1+1    RF3COM / RFTX2                  RF1COM / RFRX1
 #   PRX+DRX    1cc n+m2   RF1COM/RFTX1 + RF3COM/RFTX2     RF1COM / RFRX1
+# 新增 RF3+RF2 台面（主集 RF3C/RFRX2，分集 RF2C；DRX 用 RFTX1 而非主集的 RFTX2）：
+#   PRX        1cc 1+1    RF3COM / RFTX2                  RF3COM / RFRX2
+#   DRX        1cc 1+1    RF2COM / RFTX1                  RF3COM / RFRX2
+#   PRX+DRX    1cc n+m2   RF3COM/RFTX2 + RF2COM/RFTX1     RF3COM / RFRX2
 # 手册依据: 23.5.4 Signal Routing p.1741~1743（SCEL/MIMO22）；
 # MIMO22 下 FETC:EBLer:REL? 返回两流合并总体 Throughput（p.1773），扫描判据无需分叉。
 RX_PATH_MODES = ("prx", "drx", "prx_drx")
@@ -1637,7 +1641,8 @@ RX_PATH_UI_PREFIX = {
 #   main = (上行连接器, 该口下行转换器, 该口上行转换器)
 #   div  = (分集连接器, 第二流下行转换器)
 #   drx_tx = 可选的 DRX 单流下行转换器；缺省用 main.tx（主集转换器打到分集口，
-#            RF1+RF2 / RF3+RF4 如此），RF1+RF3 台面则为 TX2，需显式覆盖。
+#            RF1+RF2 / RF3+RF4 如此），RF1+RF3（TX2）/ RF3+RF2（TX1）台面则用
+#            分集口自己的转换器，需显式覆盖。
 # 展开规则（与真机路由表逐条对齐，见 selftest 断言）：
 #   PRX      SCEL   上行 main.rx,  下行 main.tx @ main.conn
 #   DRX      SCEL   上行 main.rx,  下行 drx_tx @ div.conn
@@ -1652,8 +1657,11 @@ RF_PORT_COMBOS = {
     "RF1+RF3": {"desc": "RF1COM 主集 + RF3COM 分集（RFTX1/RFTX2，RFRX1）",
                 "main": ("RF1C", "TX1", "RX1"), "div": ("RF3C", "TX2"),
                 "drx_tx": "TX2"},
+    "RF3+RF2": {"desc": "RF3COM 主集 + RF2COM 分集（RFTX2/RFTX1，RFRX2）",
+                "main": ("RF3C", "TX2", "RX2"), "div": ("RF2C", "TX1"),
+                "drx_tx": "TX1"},
 }
-RF_PORT_COMBO_CUSTOM = "自定义"   # 端口与三套预设都不符时下拉显示这一项
+RF_PORT_COMBO_CUSTOM = "自定义"   # 端口与四套预设都不符时下拉显示这一项
 RX_PATH_MODE_SHORT = {"prx": "PRX", "drx": "DRX", "prx_drx": "PRX+DRX"}
 
 
@@ -1664,8 +1672,8 @@ def rf_ports_from_combo(name):
         return None
     mc, mt, mr = c["main"]
     dc, dt = c["div"]
-    # RF1+RF3 的 DRX 单流走 RFTX2（分集口自己的转换器），其余预设缺省仍用
-    # 主集转换器 mt；PRX+DRX 第二流始终用 div.tx。
+    # RF1+RF3（TX2）/ RF3+RF2（TX1）的 DRX 单流走分集口自己的转换器，
+    # 其余预设缺省仍用主集转换器 mt；PRX+DRX 第二流始终用 div.tx。
     d1t = c.get("drx_tx", mt)
     return {
         "prx": {"scenario": "SCEL", "rx": [mc, mr], "tx": [[mc, mt]]},
@@ -1812,7 +1820,7 @@ def rx_ports_cfg(cfg=None):
 
 
 def combo_of_cfg(cfg=None):
-    """当前生效配置对应的 RF 口组合名；三套预设都不符时返回 None（自定义）。"""
+    """当前生效配置对应的 RF 口组合名；四套预设都不符时返回 None（自定义）。"""
     if isinstance(cfg, dict):
         name = str(cfg.get("rf_port_combo") or "").strip()
         if name in RF_PORT_COMBOS:
@@ -5764,7 +5772,7 @@ def run_selftest():
     assert normalize_rx_path_ports(_bad["rx_path_ports"])["drx"]["rx"] == (
         "RF1C", "RX1"), "非法连接器回退默认"
 
-    # ---- RF 口组合：三套预设必须逐条还原路由表/真机日志里的命令 ----
+    # ---- RF 口组合：四套预设必须逐条还原路由表/真机日志里的命令 ----
     # 旧台面 RF1COM/RF2COM（17:36~17:44 三份日志）与 RF3COM/RF4COM（19:10~19:14）
     # 各三条路由，全部由「主集/分集」两行展开，换口不再手改 6 处
     _p1 = normalize_rx_path_ports(rf_ports_from_combo("RF1+RF2"))
@@ -5783,9 +5791,17 @@ def run_selftest():
         "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF1C,TX1",
         "ROUT:LTE:SIGN:SCEN:SCEL RF1C,RX1,RF3C,TX2",
         "ROUT:LTE:SIGN:SCEN:MIMO22 RF1C,RX1,RF1C,TX1,RF3C,TX2"], "RF1+RF3 三模式路由"
-    # 组合反查：三套预设都能反查回名字，手改的单口识别为自定义
+    # RF3+RF2（新台面）：DRX 走 RF2C/RFTX1，双流第二流也是 RF2C/RFTX1，
+    # 上行固定 RF3C/RFRX2（与 RF3+RF4 的 RX2 同，但分集是 RF2C 且 DRX 用 TX1）
+    _p32 = normalize_rx_path_ports(rf_ports_from_combo("RF3+RF2"))
+    assert [rx_route_from_ports(m, _p32) for m in RX_PATH_MODES] == [
+        "ROUT:LTE:SIGN:SCEN:SCEL RF3C,RX2,RF3C,TX2",
+        "ROUT:LTE:SIGN:SCEN:SCEL RF3C,RX2,RF2C,TX1",
+        "ROUT:LTE:SIGN:SCEN:MIMO22 RF3C,RX2,RF3C,TX2,RF2C,TX1"], "RF3+RF2 三模式路由"
+    # 组合反查：四套预设都能反查回名字，手改的单口识别为自定义
     assert combo_of_ports(_p1) == "RF1+RF2" and combo_of_ports(_p3) == "RF3+RF4"
     assert combo_of_ports(_p13) == "RF1+RF3", "RF1+RF3 反查"
+    assert combo_of_ports(_p32) == "RF3+RF2", "RF3+RF2 反查"
     assert combo_of_ports(_pcfg["rx_path_ports"]) is None, "手改端口应为自定义"
     # 组合优先级高于 rx_path_ports（config 里同时存在时以组合为准）
     assert rx_route_from_ports("prx", rx_ports_cfg(
@@ -5816,6 +5832,23 @@ def run_selftest():
     assert "ACTivate RF1C, 'losstable', TX" in _fdc13
     assert "ACTivate RF3C, 'losstable', TX" in _fdc13
     assert "ACTivate RF1C, 'losstable', RX" in _fdc13 and "RF2C" not in _fdc13
+    # RF3+RF2 的表格 / 悬停提示 / 归一化 / FDC 校准口
+    _tbl32 = rf_path_table_text({"rf_port_combo": "RF3+RF2"})
+    assert "RF3COM/RFTX2" in _tbl32 and "RF2COM/RFTX1" in _tbl32
+    assert "RF3COM/RFRX2" in _tbl32 and "RF4COM" not in _tbl32
+    assert "RF3+RF2" in rf_path_tip({"rf_port_combo": "RF3+RF2"}), "提示带组合名"
+    assert normalize_cfg({"rf_port_combo": "RF3+RF2"})["rx_path_ports"] == _p32
+    _fdc32 = "\n".join(build_fdc_commands(
+        {"rx_path": "prx_drx", "rf_port_combo": "RF3+RF2", "freq_loss_enable": True,
+         "freq_loss_segments": "450:0.3, 800:0.5"}))
+    assert "ACTivate RF3C, 'losstable', TX" in _fdc32
+    assert "ACTivate RF2C, 'losstable', TX" in _fdc32
+    assert "ACTivate RF3C, 'losstable', RX" in _fdc32 and "RF1C" not in _fdc32
+    # 界面保存回归：RF3+RF2 写回后下发也必须是本组合（不退回默认 RF1+RF2）
+    _ui32 = apply_ui_rf_to_cfg(dict(CONFIG_DEFAULTS), "RF3+RF2", _p32)
+    assert _ui32["rf_port_combo"] == "RF3+RF2", "界面组合必须写回 cfg"
+    assert rx_route_from_ports("drx", rx_ports_cfg(normalize_cfg(_ui32))) == \
+        "ROUT:LTE:SIGN:SCEN:SCEL RF3C,RX2,RF2C,TX1", "保存后 DRX 应为 RF3+RF2 路由"
     # 归一化：非法组合名 → 退回 rx_path_ports（不报错、不改端口）
     assert normalize_cfg({"rf_port_combo": "RF9+RF10"})["rf_port_combo"] == ""
     assert normalize_cfg({"rf_port_combo": "RF1+RF2"})["rx_path_ports"] == _p1
@@ -7198,7 +7231,7 @@ class App(tk.Tk):
         self.cmw_board_var = tk.StringVar(value=gpib_board_label(_cmw_board))
         _mode0 = norm_rx_path(rx_path_from_ui(c.get("rx_path", "prx")))
         self.rx_path_var = tk.StringVar(value=rx_path_display(_mode0, c))
-        # RF 口组合：三套预设（RF1+RF2 / RF3+RF4 / RF1+RF3）+「自定义（按 config）」
+        # RF 口组合：四套预设（RF1+RF2 / RF3+RF4 / RF1+RF3 / RF3+RF2）+「自定义（按 config）」
         self.rf_combo_var = tk.StringVar(
             value=combo_of_cfg(c) or RF_PORT_COMBO_CUSTOM)
 
@@ -7385,7 +7418,7 @@ class App(tk.Tk):
                         self.rx_path_var.get(),
                         rx_path_desc(rx_path_from_ui(self.rx_path_var.get()),
                                      self.cfg_loaded)))
-        # RF 口组合：三套预设下拉，选完三种模式的路由/校准口自动展开；
+        # RF 口组合：四套预设下拉，选完三种模式的路由/校准口自动展开；
         # 悬停提示里直接给映射表（等宽字体逐列对齐），换口不用再翻日志推
         ttk.Label(f1, text="RF口:").grid(row=0, column=10, sticky="w", padx=(10, 4))
         _rf_vals = list(RF_PORT_COMBOS) + [RF_PORT_COMBO_CUSTOM]
@@ -7486,6 +7519,7 @@ class App(tk.Tk):
                     "  RF1+RF2 = RF1COM主集/RF2COM分集（TX1/TX3，RX1）\n"
                     "  RF3+RF4 = RF3COM主集/RF4COM分集（TX2/TX4，RX2）\n"
                     "  RF1+RF3 = RF1COM主集/RF3COM分集（TX1/TX2，RX1；DRX 用 TX2）\n"
+                    "  RF3+RF2 = RF3COM主集/RF2COM分集（TX2/TX1，RX2；DRX 用 TX1）\n"
                     "  选中后 PRX/DRX/PRX+DRX 的路由与 FDC 校准口自动展开\n"
                     "• rx_path_ports：手写端口表（组合留空时生效，自定义接法用）\n"
                     "  改完界面下拉与悬停映射表自动刷新",
@@ -7926,7 +7960,7 @@ class App(tk.Tk):
         """配置里改了 RF 口后刷新下拉选项与显示（保持当前选中模式）。"""
         cur_mode = rx_path_from_ui(self.rx_path_var.get())
         values = self._rx_path_ui_values()
-        # RF 口组合下拉：选到三套预设之一就显示组合名，否则显示「自定义」
+        # RF 口组合下拉：选到四套预设之一就显示组合名，否则显示「自定义」
         if hasattr(self, "rf_combo_cb"):
             combo = combo_of_cfg(self.cfg_loaded) or RF_PORT_COMBO_CUSTOM
             if str(self.rf_combo_var.get()) != combo:
