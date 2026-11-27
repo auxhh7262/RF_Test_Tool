@@ -14,8 +14,12 @@ build/
 *.spec
 !*.keep
 # 打包产物单文件 9.5M，入库会让 .git 每次提交涨 9.5M，不入库
-dist/*.exe
-dist/*.pdb
+/*.exe
+/*.pdb
+# 旧的 dist 输出目录（已扁平化到根目录，此目录不再生成）
+dist/
+# 自检输出
+selftest_result.txt
 
 # ====== 运行数据 ======
 logs/
