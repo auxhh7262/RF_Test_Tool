@@ -7,6 +7,7 @@
   "_comment3": "at_port 填你的 AT 口 COM 号（无 AT 功能可忽略）",
   "instrument": "CMW500",
   "psu_model": "E36312A",
+  "_comment_psu_model": "电源型号 E36312A(默认,LAN 5025 或 GPIB) 或 E3631A(老三路,无 LAN,只能 GPIB/RS-232; 本工具走 GPIB,出厂地址 5)。E3631A 自动改用 APPL/OUTP 命令, N25V 为 -25V(填幅值)。OUTP ON 会开全部三路, P25V/N25V 请保持 0V 或不接负载。",
   "_comment_psu_enable": "程控: true=初始化并测量电源(电压/电流), false=不程控电源(射频指标不受影响)",
   "cmw_ip": "192.168.1.100",
   "cmw_port": "5025",

@@ -2004,15 +2004,34 @@ def build_eatt_output_commands(cfg, loss):
     return ["CONF:%s:RFS:EATT:OUTP %s" % (p, _fmt_db(loss))]
 
 
-# E36312A = CH1/CH2/CH3。CH3 的 SCPI 标识符仍是 N25V（E36300 Programming Guide
-# "Programming Ranges" 表），但正常模式下 E36312A/E36313A 的 CH3 输出 +25V；
-# 只有 E36311A 或 SCPI ID 设为 E3631A 的兼容模式才是 -25V。故按 E36312A 取正电压。
+# 电源型号：两种程控语法完全不同，必须按型号分支，不能只改 ID 蒙混。
+#   E36312A（E36300 系列）：SOUR:VOLT x,(@n) / OUTP ON,(@n)，N25V 正常模式输出 +25V。
+#   E3631A（老三路）：APPL <ch>,<v>,MAX / OUTP ON（无 (@n)），N25V 是真正的 -25V。
+# 通道名 P6V/P25V/N25V 两代相同，MEAS:CURR?/MEAS:VOLT? 用法也相同。
+PSU_MODELS = ("E36312A", "E3631A")
 PSU_CHANNELS = ("P6V", "P25V", "N25V")
-PSU_VOLT_RANGE = {
-    "P6V": (0.0, 6.18, "0 ~ 6.18 V"),
-    "P25V": (0.0, 25.75, "0 ~ +25.75 V"),
-    "N25V": (0.0, 25.75, "0 ~ +25.75 V"),
+PSU_VOLT_RANGES = {
+    "E36312A": {
+        "P6V": (0.0, 6.18, "0 ~ 6.18 V"),
+        "P25V": (0.0, 25.75, "0 ~ +25.75 V"),
+        "N25V": (0.0, 25.75, "0 ~ +25.75 V"),
+    },
+    # E3631A 手册 E3631-90002 p.84/97：CH1 0~6V/5A，CH2 0~+25V/1A，CH3 0~-25V/1A
+    "E3631A": {
+        "P6V": (0.0, 6.00, "0 ~ 6 V"),
+        "P25V": (0.0, 25.00, "0 ~ +25 V"),
+        "N25V": (0.0, 25.00, "0 ~ -25 V（填幅值，实际下发负值）"),
+    },
 }
+PSU_VOLT_RANGE = PSU_VOLT_RANGES["E36312A"]   # 兼容旧引用
+
+
+def psu_volt_range(model, ch):
+    """按电源型号/通道返回 (下限, 上限, 提示文本)；未知型号回落 E36312A。"""
+    table = PSU_VOLT_RANGES.get(str(model or "").strip()) or PSU_VOLT_RANGES["E36312A"]
+    return table.get(ch, (0.0, 0.0, "未知通道"))
+
+
 PSU_DEFAULT_SAMPLES = 3
 
 # 结果目录
@@ -2025,7 +2044,7 @@ CHECKPOINT_PATH = os.path.join(STATE_DIR, "checkpoint.json")
 CHECKPOINT_VERSION = 1
 
 CONFIG_DEFAULTS = {
-    "instrument": "CMW500", "psu_model": "E36312A",  # 仪表/电源型号下拉（预留扩展）
+    "instrument": "CMW500", "psu_model": "E36312A",  # 仪表/电源型号；电源可选 E36312A / E3631A
     # *_ip 只存 LAN 地址（IPv4/主机名，配合 *_port）；*_gpib_addr 只存 GPIB 主地址数字，
     # 板号放在 *_gpib_board（0 = 第 1 块 GPIB 卡）。两个槽互不覆盖：
     # 接口下拉在 LAN / GPIB 间切换时自动回填各自上次用过的地址，不用重新输入。
@@ -2043,7 +2062,7 @@ CONFIG_DEFAULTS = {
                       for m, p in RX_PATH_PORTS_DEFAULT.items()},
     "psu_enable": True, "psu_ip": "", "psu_port": "5025", "psu_link": "LAN",
     "psu_gpib_board": 0,
-    "psu_gpib_addr": "5",       # Keysight E36312A 出厂 GPIB 主地址，切到 GPIB 自动回填
+    "psu_gpib_addr": "5",       # E36312A / E3631A 出厂 GPIB 主地址都是 5，切到 GPIB 自动回填
     # 电源采样策略（对测试速度影响 <1%，主要影响日志量与电源口往返次数）：
     #   tx_only = 有 TX 指标（maxpower/aclr/evm/freqerr）才逐组合采，纯 RX 只在开跑前采 1 次
     #   always  = 保持旧行为（每个组合都采 Pmax/Pmin 两档电流）
@@ -3217,12 +3236,24 @@ def check_scpi_errors(scpi, log=None, ctx=""):
 
 
 def build_psu_voltage_commands(cfg):
-    """电源输出电压并开启（手册 E36311-90008 p.5 / p.69）。"""
+    """电源输出电压并开启，按型号走两套不同的 SCPI 语法。
+    - E36312A：SOUR:VOLT x,(@n) + OUTP ON,(@n)（E36300 编程指南 p.5/p.69）。
+    - E3631A ：APPL <ch>,<v>,MAX + OUTP ON（手册 E3631-90002 p.84/96）。
+      APPLy 一条命令同时选通道并设电压/电流，老机不支持 (@n) 通道语法；
+      OUTP 无参数，打开全部三路（故 P25V/N25V 请保持 0V 或不接负载）；
+      N25V 是负电压通道，配置填幅值，下发时取负。电流限用 MAX，避免 DUT
+      发射峰值触发限流导致电压跌落、影响功耗读数。
+    """
     if not cfg.get("psu_enable") or not cfg.get("psu_voltage"):
         return []
     ch = cfg.get("psu_channel", "P6V")
-    n = cfg.get("psu_channel_index", {ch: i + 1 for i, ch in enumerate(PSU_CHANNELS)}).get(ch, 1)
     v = float(cfg["psu_voltage"])
+    if str(cfg.get("psu_model") or "E36312A").strip() == "E3631A":
+        if ch not in PSU_CHANNELS:
+            ch = PSU_CHANNELS[0]
+        vv = -abs(v) if ch == "N25V" else v
+        return ["APPL %s,%.4f,MAX" % (ch, vv), "OUTP ON"]
+    n = cfg.get("psu_channel_index", {c: i + 1 for i, c in enumerate(PSU_CHANNELS)}).get(ch, 1)
     return ["SOUR:VOLT %.4f,(@%d)" % (v, n), "OUTP ON,(@%d)" % n]
 
 
@@ -6494,9 +6525,19 @@ def run_selftest():
     # Desense = 大功率灵敏度 - 小功率灵敏度
     assert abs(float(wide_both[-1]) -
                (float(wide_both[-3]) - float(wide_both[-2]))) <= 0.11, wide_both
-    # 电源命令
+    # 电源命令：E36312A 用 (@n)，E3631A 用 APPL/OUTP，不能混用
     pv = build_psu_voltage_commands(dict(cfg, psu_enable=True, psu_voltage="3.8", psu_channel="P6V"))
     assert "SOUR:VOLT 3.8000,(@1)" in pv and "OUTP ON,(@1)" in pv
+    pv31 = build_psu_voltage_commands(
+        dict(cfg, psu_model="E3631A", psu_enable=True, psu_voltage="3.8", psu_channel="P6V"))
+    assert pv31 == ["APPL P6V,3.8000,MAX", "OUTP ON"], pv31
+    pv31n = build_psu_voltage_commands(
+        dict(cfg, psu_model="E3631A", psu_enable=True, psu_voltage="12", psu_channel="N25V"))
+    assert pv31n == ["APPL N25V,-12.0000,MAX", "OUTP ON"], pv31n
+    assert psu_volt_range("E3631A", "P6V")[1] == 6.0
+    assert psu_volt_range("E36312A", "P6V")[1] == 6.18
+    assert psu_volt_range("未知型号", "P6V")[1] == 6.18, "未知型号回落 E36312A"
+    assert PSU_MODELS == ("E36312A", "E3631A")
     # 结果行
     d = demo_measurement(dict(cfg, metrics={k: True for k in METRIC_KEYS}))
     rows = make_rows(d, {"evm_lim": "17.5", "aclr_lim": "30", "freq_lim": "100"})
@@ -6878,7 +6919,10 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
 
 1. 连接
    - 网线接 CMW500 后面板 LAN(REMOTE) 口，Data Port 默认 5025。
-   - 电源 E36312A 同样走 LAN socket 5025、LF 结尾，复用同一套传输。
+   - 电源 E36312A 走 LAN socket 5025、LF 结尾，复用同一套传输。
+   - 电源 E3631A 没有 LAN，只有 GPIB / RS-232；本工具走 GPIB：电源型号选
+     E3631A、接口选 GPIB、地址填主地址数字（出厂 5），需 GPIB 卡 + NI-488.2
+     或 Keysight GPIB 驱动。程控语法自动切换为 APPL/OUTP（老机不认 (@n)）。
    - IP/端口/RF口/电压等全部自动保存到 config.json，下次启动自动恢复。
 
 1a. AT 控制（USB 串口 / 手动 debug）
@@ -6940,9 +6984,12 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    - 功率 / ACLR / EVM / 频率误差：连接态下 Multi Evaluation
      测 DUT 上行（FETC:LTE:MEAS:MEV，手册 21.5.3），在所选测试场景的
      功率档下测得（Pmax 场景即 TPC MAXPower 满功率）。
-   - 电压 / 电流：电源启用且勾选了 TX 指标时默认同步记录，无需勾选；E36312A 读
-     MEAS:CURR?/MEAS:VOLT?（测量前读待机、测量时读发射）。只测 RX 灵敏度
-     （未勾任何 TX 指标）时，电压/电流列不显示。
+   - 电压 / 电流：电源启用且勾选了 TX 指标时默认同步记录，无需勾选；两款电源都读
+     MEAS:CURR? <通道>/MEAS:VOLT? <通道>（测量前读待机、测量时读发射），返回
+     单位 A，工具统一 ×1000 存 mA。只测 RX 灵敏度（未勾任何 TX 指标）时，
+     电压/电流列不显示。
+   - E3631A 注意：OUTP ON 会打开全部三路输出，P25V/N25V 请保持 0V 或不接负载；
+     两路 ±25V 不要开 TRACk 跟踪。N25V 填幅值，工具自动按下发负电压。
      结果表组合列 = 频段 / 带宽 / DL Channel（工具实际下发的是 DL EARFCN，
      即 CONF:LTE:SIGN:RFS:CHAN:DL；TDD 频段 UL/DL 同频，仍按 DL 口径）/
      UL RB配置（LCRB@RBstart，取自本地
@@ -7055,6 +7102,7 @@ HELP_TEXT = r"""使用要点（依据 CMW500 Operating Manual 2.0.10 / E36300 �
    - PDF p.1728/1734      23.4.1 小区配置 / 23.4.2 BLER 测试
    - PDF p.1737/1768      23.5.2 连接控制 / 23.5.10 BLER 命令
    - E36311-90008 p.5/17/69  SOUR:VOLT / 通道 / MEAS:CURR?
+   - E3631-90002 p.84/96/97  APPLy / INST:SEL / OUTP / MEAS / CURR（老机命令）
 """
 
 
@@ -7504,7 +7552,7 @@ class App(tk.Tk):
         f2.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
         ttk.Label(f2, text="电源:").grid(row=0, column=0, sticky="w", padx=(2, 4))
         self.psu_model_cb = ttk.Combobox(f2, textvariable=self.psu_model_var,
-                                         values=["E36312A"], width=10, state="readonly")
+                                         values=list(PSU_MODELS), width=10, state="readonly")
         self.psu_model_cb.grid(row=0, column=1, sticky="w")
         ttk.Label(f2, text="接口:").grid(row=0, column=2, sticky="w", padx=(8, 4))
         self.psu_iface_cb = ttk.Combobox(f2, textvariable=self.psu_iface_var,
@@ -7546,22 +7594,24 @@ class App(tk.Tk):
         ch = ttk.Combobox(f2, textvariable=self.psu_channel_var, values=list(PSU_CHANNELS),
                           width=8, state="readonly")
         ch.grid(row=0, column=9, sticky="w")
-        _attach_tip(ch,
-                    "电源输出通道（E36312A）：\n"
-                    "• P6V = CH1，0 ~ 6.18 V\n"
-                    "• P25V = CH2，0 ~ +25.75 V\n"
-                    "• N25V = CH3，0 ~ +25.75 V（正电压）\n"
-                    "• 注：N25V 是 SCPI 通道标识符，E36312A 正常模式下输出正电压；"
-                    "负电压仅见于 E36311A 或 E3631A 兼容模式")
+        _attach_tip(ch, lambda: (
+            "电源输出通道（%s）：\n" % self.psu_model_var.get() +
+            ("• P6V = CH1，0 ~ 6 V\n• P25V = CH2，0 ~ +25 V\n"
+             "• N25V = CH3，0 ~ -25 V（负电压，填幅值即可）\n"
+             "• 老机无 LAN：只支持 GPIB / RS-232，本工具走 GPIB（出厂地址 5）\n"
+             if self.psu_model_var.get() == "E3631A" else
+             "• P6V = CH1，0 ~ 6.18 V\n• P25V = CH2，0 ~ +25.75 V\n"
+             "• N25V = CH3，0 ~ +25.75 V（正电压）\n"
+             "• N25V 是 SCPI 通道标识符，E36312A 正常模式下输出正电压")))
         ttk.Label(f2, text="电压(V):").grid(row=0, column=10, sticky="w", padx=(8, 4))
         psu_volt_entry = ttk.Entry(f2, textvariable=self.psu_voltage_var, width=9)
         psu_volt_entry.grid(row=0, column=11, sticky="w")
         _attach_tip(psu_volt_entry, lambda: (
-            "输出电压（V），范围随通道变化：\n"
-            "• P6V: 0 ~ 6.18 V\n• P25V: 0 ~ +25.75 V\n• N25V: 0 ~ +25.75 V（CH3 正电压）\n"
-            "• 当前通道 %s（%s），超限会被拒绝" % (
-                self.psu_channel_var.get(),
-                PSU_VOLT_RANGE.get(self.psu_channel_var.get(), (0, 0, "未知"))[2])))
+            "输出电压（V），范围随电源型号/通道变化：\n" +
+            "".join("• %s: %s\n" % (c, psu_volt_range(self.psu_model_var.get(), c)[2])
+                    for c in PSU_CHANNELS) +
+            "• 当前 %s / %s，超限会被拒绝" % (
+                self.psu_model_var.get(), self.psu_channel_var.get())))
         # 程控复选框：勾选才初始化/测量电源；放在电压输入框之后
         self.psu_enable_cb = ttk.Checkbutton(f2, text="程控", variable=self.psu_enable_var,
                                             command=self._on_psu_enable_change)
@@ -8820,7 +8870,7 @@ class App(tk.Tk):
             if cfg["psu_channel"] not in PSU_CHANNELS:
                 raise ValueError("电源通道只能是 P6V/P25V/N25V")
             if cfg["psu_voltage"]:
-                lo, hi, hint = PSU_VOLT_RANGE[cfg["psu_channel"]]
+                lo, hi, hint = psu_volt_range(cfg.get("psu_model"), cfg["psu_channel"])
                 v = float(cfg["psu_voltage"])
                 if v < lo or v > hi:
                     raise ValueError("电压 %.3f 超出 %s 范围 %s" % (v, cfg["psu_channel"], hint))
