@@ -6798,19 +6798,20 @@ def run_selftest():
     assert band_points_count("OB1", "B100", True) == 501
     assert band_points_count("OB1", "B100", True) == len(_cmb_full)
     assert CONFIG_DEFAULTS["full_scan"] is False
-    # RX 三模式互斥：选中任意一个都清掉另两项且保持 sensitivity=True
+    # RX 三模式真正互斥：三个界面变量各自独立，选中谁只有谁亮；
+    # sensitivity 指标是派生值（任一模式选中即为真），不绑定界面复选框
     _fake.metric_vars = {"sensitivity": _FakeVar(False)}
-    _fake.full_scan_var, _fake.range_scan_var = _FakeVar(False), _FakeVar(False)
-    for _m, _chk in (("three", lambda: not _fake.full_scan_var.get()
-                      and not _fake.range_scan_var.get()),
-                     ("full", lambda: _fake.full_scan_var.get()
-                      and not _fake.range_scan_var.get()),
-                     ("range", lambda: _fake.range_scan_var.get()
-                      and not _fake.full_scan_var.get())):
+    _fake.three_scan_var, _fake.full_scan_var, _fake.range_scan_var = (
+        _FakeVar(False), _FakeVar(False), _FakeVar(False))
+    for _m in ("three", "full", "range"):
         App._set_rx_mode(_fake, _m)
-        assert _fake.metric_vars["sensitivity"].get() and _chk(), _m
+        _on = {"three": _fake.three_scan_var, "full": _fake.full_scan_var,
+               "range": _fake.range_scan_var}
+        assert sum(v.get() for v in _on.values()) == 1 and _on[_m].get(), _m
+        assert _fake.metric_vars["sensitivity"].get(), _m
     App._set_rx_mode(_fake, "none")
     assert not _fake.metric_vars["sensitivity"].get() \
+        and not _fake.three_scan_var.get() \
         and not _fake.full_scan_var.get() and not _fake.range_scan_var.get()
     # 宽表：一行一个组合，指标按列（UL RB+sens_limit 已移到 TX 指标后、灵敏度前）
     _metrics_all = {"sensitivity": True, "maxpower": True, "aclr": True, "evm": True,
@@ -7648,13 +7649,17 @@ class App(tk.Tk):
         self.sens_power_mode_var = tk.StringVar(value=_mode)
         self.sens_low_power_var = V("sens_low_power")
         # RX 三种灵敏度模式互斥：三信道 / 全信道 / 自定义范围（三选一）。
-        # 旧配置可能同时勾多项，按 自定义 > 全信道 > 三信道 归一化，避免界面多选。
+        # 三个复选框各绑独立变量，界面上真正互斥；sensitivity 指标由模式
+        # 派生（任一模式选中即为真），只用于结果表是否出灵敏度列，
+        # 不再直接绑定「三信道灵敏度」复选框，避免选另两项时它也亮。
+        # 旧配置可能同时勾多项，按 自定义 > 全信道 > 三信道 归一化。
         _rx_init = ("range" if c.get("range_scan") else
                     "full" if c.get("full_scan") else
                     "three" if bool(c["metrics"].get("sensitivity", True)) else "none")
-        self.metric_vars["sensitivity"].set(_rx_init != "none")
+        self.three_scan_var = tk.BooleanVar(value=(_rx_init == "three"))
         self.full_scan_var = tk.BooleanVar(value=(_rx_init == "full"))
         self.range_scan_var = tk.BooleanVar(value=(_rx_init == "range"))
+        self.metric_vars["sensitivity"].set(_rx_init != "none")  # 内部派生
         self.channel_ranges = normalize_channel_ranges(c.get("channel_ranges"))
 
         # AT 控制行：串口选择（空/auto=自动识别）+ 手动 debug 指令输入
@@ -8008,13 +8013,14 @@ class App(tk.Tk):
         rframe = ttk.Frame(bf_rx)
         rframe.pack(fill="x")
         # 控件顺序：三信道灵敏度 → 全信道灵敏度 → 自定义信道范围 +【设置范围】
-        # 信道集与灵敏度指标解耦，全信道/自定义范围对所有已勾选指标生效
-        self.sensitivity_cb = ttk.Checkbutton(
+        # 三者各绑独立变量、真正互斥；灵敏度指标是内部派生，不直接绑界面
+        self.three_scan_cb = ttk.Checkbutton(
             rframe, text=METRIC_LABELS["sensitivity"],
-            variable=self.metric_vars["sensitivity"],
-            command=self._on_sensitivity_toggle)
+            variable=self.three_scan_var,
+            command=self._on_three_scan_toggle)
+        self.sensitivity_cb = self.three_scan_cb  # 兼容旧引用
         self.sensitivity_cb.grid(row=0, column=0, sticky="w", padx=(2, 10), pady=3)
-        _attach_sensitivity_tip(self.sensitivity_cb)
+        _attach_sensitivity_tip(self.three_scan_cb)
         self.full_scan_cb = ttk.Checkbutton(
             rframe, text="全信道灵敏度", variable=self.full_scan_var,
             command=self._on_full_scan_toggle)
@@ -8321,19 +8327,20 @@ class App(tk.Tk):
     def _set_rx_mode(self, mode):
         """RX 三模式互斥：three / full / range / none。
 
-        三者都是灵敏度测试的不同信道集，选中任意一个都必须保持
-        sensitivity=True（否则结果表不出灵敏度列）；取消当前项则
-        三者全清，回到不测灵敏度。
+        三个复选框各绑独立的 three_scan/full_scan/range_scan 变量，
+        选中谁就只有谁亮。sensitivity 指标是内部派生：任一模式选中
+        即为真（结果表才出灵敏度列），不绑定界面复选框。
         """
-        self.metric_vars["sensitivity"].set(mode != "none")
+        self.three_scan_var.set(mode == "three")
         self.full_scan_var.set(mode == "full")
         self.range_scan_var.set(mode == "range")
+        self.metric_vars["sensitivity"].set(mode != "none")  # 派生，不绑界面
         self._refresh_band_bw_summary()
         self._on_metrics_change()
 
-    def _on_sensitivity_toggle(self):
+    def _on_three_scan_toggle(self):
         """三信道灵敏度：勾上则清掉另两项，取消则三者全清。"""
-        self._set_rx_mode("three" if self.metric_vars["sensitivity"].get() else "none")
+        self._set_rx_mode("three" if self.three_scan_var.get() else "none")
 
     def _on_full_scan_toggle(self):
         """全信道灵敏度：勾上则清掉另两项，取消则三者全清。"""
