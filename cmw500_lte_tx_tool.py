@@ -7968,32 +7968,8 @@ class App(tk.Tk):
         metrics_row = ttk.Frame(mid)
         metrics_row.pack(fill="x")
 
-        # ① 测试场景（TX/RX 公用）：选 Pmax / Pmin / Pmax+Pmin 后再勾指标，
-        #    所有勾选的 TX/RX 指标都在所选场景下测量，结果列带档位标注。
-        bf_scenario = ttk.LabelFrame(metrics_row, text="① 测试场景", padding=(8, 5))
-        bf_scenario.pack(side="left", fill="y", padx=(0, 8))
-        sframe = ttk.Frame(bf_scenario)
-        sframe.pack(fill="x")
-        for j, mode in enumerate(SENS_POWER_MODES):
-            ttk.Radiobutton(sframe, text=SENS_POWER_LABELS[mode], value=mode,
-                            variable=self.sens_power_mode_var,
-                            command=self._on_sens_mode_change).grid(
-                row=0, column=j, sticky="w", padx=(0, 10), pady=3)
-        ttk.Label(sframe, text="Pmin:").grid(row=0, column=3, sticky="w", padx=(4, 4))
-        self.sens_low_power_entry = ttk.Entry(sframe, width=6,
-                                               textvariable=self.sens_low_power_var)
-        self.sens_low_power_entry.grid(row=0, column=4, sticky="w", padx=(0, 2))
-        ttk.Label(sframe, text="(dBm)").grid(row=0, column=5, sticky="w", padx=(0, 6))
-        # Pmin 含义说明改为鼠标悬停提示，避免占用左右显示空间
-        # 空=最小功率(MINPower)；填值=Closed Loop 功率(-50~23 dBm)
-        _attach_tip(self.sens_low_power_entry,
-                    "Pmin 小功率档（单位 dBm，范围 -50~23）\n"
-                    "留空：使用仪表 MINPower（最小发射功率）\n"
-                    "填值：下发给 CONF:LTE:SIGN:UL:TPC:CLTPower（闭环功率）\n"
-                    "仅在测试场景选 Pmin 或 Pmax+Pmin 时生效。")
-
-        # ② 测试信道（TX/RX 公用）：三种信道集互斥，对所有已勾选指标生效
-        bf_ch = ttk.LabelFrame(metrics_row, text="② 测试信道（TX/RX 通用）",
+        # ① 测试信道（TX/RX 公用）：三种信道集互斥，对所有已勾选指标生效
+        bf_ch = ttk.LabelFrame(metrics_row, text="① 测试信道（TX/RX 通用）",
                                padding=(8, 5))
         bf_ch.pack(side="left", fill="y", padx=(0, 8))
         cframe = ttk.Frame(bf_ch)
@@ -8016,6 +7992,30 @@ class App(tk.Tk):
         ttk.Button(cframe, text="设置范围", width=9,
                    command=self._open_channel_range_dialog).grid(
                        row=0, column=3, sticky="w", padx=(2, 6), pady=3)
+
+        # ② 测试场景（TX/RX 公用）：选 Pmax / Pmin / Pmax+Pmin 后再勾指标，
+        #    所有勾选的 TX/RX 指标都在所选场景下测量，结果列带档位标注。
+        bf_scenario = ttk.LabelFrame(metrics_row, text="② 测试场景", padding=(8, 5))
+        bf_scenario.pack(side="left", fill="y", padx=(0, 8))
+        sframe = ttk.Frame(bf_scenario)
+        sframe.pack(fill="x")
+        for j, mode in enumerate(SENS_POWER_MODES):
+            ttk.Radiobutton(sframe, text=SENS_POWER_LABELS[mode], value=mode,
+                            variable=self.sens_power_mode_var,
+                            command=self._on_sens_mode_change).grid(
+                row=0, column=j, sticky="w", padx=(0, 10), pady=3)
+        ttk.Label(sframe, text="Pmin:").grid(row=0, column=3, sticky="w", padx=(4, 4))
+        self.sens_low_power_entry = ttk.Entry(sframe, width=6,
+                                               textvariable=self.sens_low_power_var)
+        self.sens_low_power_entry.grid(row=0, column=4, sticky="w", padx=(0, 2))
+        ttk.Label(sframe, text="(dBm)").grid(row=0, column=5, sticky="w", padx=(0, 6))
+        # Pmin 含义说明改为鼠标悬停提示，避免占用左右显示空间
+        # 空=最小功率(MINPower)；填值=Closed Loop 功率(-50~23 dBm)
+        _attach_tip(self.sens_low_power_entry,
+                    "Pmin 小功率档（单位 dBm，范围 -50~23）\n"
+                    "留空：使用仪表 MINPower（最小发射功率）\n"
+                    "填值：下发给 CONF:LTE:SIGN:UL:TPC:CLTPower（闭环功率）\n"
+                    "仅在测试场景选 Pmin 或 Pmax+Pmin 时生效。")
 
         # ③ TX 指标（按测试场景的功率档测上行）—— 勾选哪些就测哪些
         bf_tx = ttk.LabelFrame(metrics_row, text="③ TX 指标", padding=(8, 5))
@@ -10069,7 +10069,7 @@ class App(tk.Tk):
                             _pmin_hint_done = True
                             self.log("[功率重测] ⚠️ Pmin 档未指定功率 → 用 MINPower"
                                      "（UE 最小发射功率，可能低到 -45dBm 量级），CMW 有可能报"
-                                     " Underdriven；若要测得到，请在「① 测试场景」的 Pmin "
+                                     " Underdriven；若要测得到，请在「② 测试场景」的 Pmin "
                                      "输入框填一个可测功率（如 -40）。本提示每次运行只出现一次。")
                         set_sens_power(scpi, cfg, "low", self.log)
                         # 弱功率档下 UE 可能已掉线：先复查注册，掉线先重附着
